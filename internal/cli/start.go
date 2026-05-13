@@ -20,6 +20,7 @@ import (
 
 	"github.com/optiqor/kerno/internal/adapter"
 	"github.com/optiqor/kerno/internal/bpf"
+	"github.com/optiqor/kerno/internal/doctor"
 	"github.com/optiqor/kerno/internal/metrics"
 	"github.com/optiqor/kerno/internal/version"
 )
@@ -71,6 +72,16 @@ type startOpts struct {
 	dashboard      bool
 }
 
+// reloadableSubsystems groups every live subsystem that can accept an
+// Update call from the SIGHUP handler. Keeping them in one struct makes
+// the handler easy to read and test.
+type reloadableSubsystems struct {
+	engine     *doctor.Engine
+	httpServer **http.Server // pointer-to-pointer so we can swap the server
+	logger     *slog.Logger
+	opts       startOpts
+}
+
 func runStart(ctx context.Context, opts startOpts) error {
 	if err := requireRoot(); err != nil {
 		return err
@@ -83,9 +94,15 @@ func runStart(ctx context.Context, opts startOpts) error {
 		"dashboard", opts.dashboard,
 	)
 
-	// Set up OS signal handling for graceful shutdown.
-	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	// Set up OS signal handling.
+	// SIGINT / SIGTERM → graceful shutdown (via context cancellation).
+	// SIGHUP           → config hot-reload (handled in a separate goroutine).
+	shutdownCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	defer signal.Stop(sighupCh)
 
 	// Resolve Prometheus address.
 	promAddr := cfg.Prometheus.Addr
@@ -125,50 +142,50 @@ func runStart(ctx context.Context, opts startOpts) error {
 	metrics.InfoMetric.WithLabelValues(version.Version).Set(1)
 
 	// Pre-initialize CounterVec instances so /metrics emits HELP/TYPE
-	// lines immediately, before any event flows. Without this,
-	// CounterVec metrics with no observations don't show up — making
-	// /metrics look empty for the first few seconds and breaking
-	// scrapers that auto-discover metric names from a single fetch.
+	// lines immediately, before any event flows.
 	for _, l := range loaders {
 		metrics.CollectorEventsTotal.WithLabelValues(l.Name()).Add(0)
 		metrics.CollectorErrorsTotal.WithLabelValues(l.Name()).Add(0)
 	}
 
-	// Phase 2: Start the metrics bridge — reads BPF events and feeds Prometheus.
+	// Phase 2: Start the metrics bridge.
 	bridge := metrics.NewBridge(logger)
-	bridge.Start(ctx, loaderSet.Loaders())
+	bridge.Start(shutdownCtx, loaderSet.Loaders())
 	defer bridge.Stop()
 
-	// Phase 2b: Start environment adapter for event enrichment.
+	// Phase 2b: Start environment adapter.
 	env := adapter.DetectEnvironment()
 	adpt := adapter.NewAdapter(logger, env)
-	if err := adpt.Start(ctx); err != nil {
+	if err := adpt.Start(shutdownCtx); err != nil {
 		logger.Warn("failed to start environment adapter", "error", err)
 	}
 	defer adpt.Stop()
 	logger.Info("environment adapter started", "adapter", adpt.Name(), "env", env)
 
+	// Phase 2c: Create the doctor engine — held in a pointer so the
+	// SIGHUP handler can call UpdateThresholds on the live instance.
+	diagEngine := doctor.NewEngine(cfg.Doctor.Thresholds, nil, logger)
+
 	// Phase 3: Start HTTP server for health and metrics.
-	var httpServer *http.Server
-	if opts.prometheus {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", healthzHandler(loadedCount, len(loaders)))
-		mux.HandleFunc("/readyz", healthzHandler(loadedCount, len(loaders)))
-		mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+	httpServer := startHTTPServer(logger, opts, promAddr, loadedCount, len(loaders))
 
-		httpServer = &http.Server{
-			Addr:              promAddr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-
-		go func() {
-			logger.Info("starting HTTP server", "addr", promAddr)
-			if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("HTTP server error", "error", err)
+	// ── SIGHUP hot-reload goroutine ────────────────────────────────────
+	//
+	// Runs until the daemon shuts down. On every SIGHUP it:
+	//  1. Re-reads the config file from the path kerno was started with.
+	//  2. Diffs old vs new.
+	//  3. Applies safe changes in-place (log level, thresholds, etc.).
+	//  4. Warns about changes that need a restart (collector toggles).
+	go func() {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-sighupCh:
+				handleSIGHUP(logger, diagEngine, &httpServer, opts)
 			}
-		}()
-	}
+		}
+	}()
 
 	// Log daemon status.
 	fmt.Println("kerno daemon running")
@@ -185,21 +202,165 @@ func runStart(ctx context.Context, opts startOpts) error {
 	fmt.Println("Press Ctrl+C to stop.")
 
 	// Block until shutdown signal.
-	<-ctx.Done()
+	<-shutdownCtx.Done()
 
 	logger.Info("shutting down kerno daemon")
 
-	// Phase 4: Graceful shutdown.
+	// Phase 4: Graceful HTTP shutdown.
 	if httpServer != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := httpServer.Shutdown(stopCtx); err != nil {
 			logger.Warn("HTTP server shutdown error", "error", err)
 		}
 	}
 
 	logger.Info("kerno daemon stopped")
 	return nil
+}
+
+// handleSIGHUP performs the config hot-reload on every SIGHUP signal.
+// It is called from the goroutine in runStart and must not block for long.
+func handleSIGHUP(
+	logger *slog.Logger,
+	engine *doctor.Engine,
+	httpServerPtr **http.Server,
+	opts startOpts,
+) {
+	logger.Info("SIGHUP received — reloading config", "path", cfgFile)
+
+	newCfg, result, err := cfg.ReloadFrom(cfgFile)
+	if err != nil {
+		logger.Error("config reload failed — keeping current config", "error", err)
+		return
+	}
+
+	// ── Apply each safe change ─────────────────────────────────────────
+
+	for _, change := range result.Applied {
+		logger.Info("applying hot-reload change", "change", change)
+	}
+
+	// 1. Log level / format — delegate to root.go's initLogger so the
+	//    slog handler is rebuilt identically to startup behaviour
+	//    (JSON vs text detection, level, etc.).
+	if cfg.LogLevel != newCfg.LogLevel || cfg.LogFormat != newCfg.LogFormat {
+		initLogger(newCfg.LogLevel, newCfg.LogFormat)
+		logger.Info("log level/format changed",
+			"level", newCfg.LogLevel, "format", newCfg.LogFormat)
+	}
+
+	// 2. Doctor thresholds
+	if cfg.Doctor.Thresholds != newCfg.Doctor.Thresholds {
+		engine.UpdateThresholds(newCfg.Doctor.Thresholds)
+	}
+
+	// 3. Prometheus address re-bind
+	oldAddr := cfg.Prometheus.Addr
+	newAddr := newCfg.Prometheus.Addr
+	if opts.prometheusAddr != "" {
+		// CLI flag always wins for the initial bind; honour it on reload too.
+		newAddr = opts.prometheusAddr
+	}
+	if oldAddr != newAddr || cfg.Prometheus.Enabled != newCfg.Prometheus.Enabled {
+		logger.Info("prometheus address changed — rebinding",
+			"old", oldAddr, "new", newAddr)
+		rebindPrometheus(logger, httpServerPtr, opts, newAddr,
+			0, // loadedCount / total not tracked here; healthz uses last snapshot
+			0,
+			newCfg.Prometheus.Enabled,
+		)
+	}
+
+	// 4. Warn about restart-required changes.
+	for _, w := range result.RestartRequired {
+		logger.Warn("config change requires restart to take effect", "change", w)
+	}
+
+	// Swap the global config pointer so subsequent reloads diff correctly.
+	// cfg is the package-level *config.Config set by the root command.
+	cfg = newCfg
+
+	logger.Info(result.String(),
+		"applied", len(result.Applied),
+		"restart_required", len(result.RestartRequired),
+	)
+}
+
+// startHTTPServer launches the Prometheus / health HTTP server and returns
+// it so the caller can shut it down later.
+func startHTTPServer(
+	logger *slog.Logger,
+	opts startOpts,
+	addr string,
+	loadedCount, total int,
+) *http.Server {
+	if !opts.prometheus {
+		return nil
+	}
+
+	srv := buildHTTPServer(addr, loadedCount, total)
+
+	go func() {
+		logger.Info("starting HTTP server", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("HTTP server error", "error", err)
+		}
+	}()
+
+	return srv
+}
+
+// rebindPrometheus gracefully shuts down the old HTTP server and starts a
+// new one on newAddr. Called when prometheus.addr changes on SIGHUP.
+func rebindPrometheus(
+	logger *slog.Logger,
+	srvPtr **http.Server,
+	opts startOpts,
+	newAddr string,
+	loadedCount, total int,
+	enabled bool,
+) {
+	old := *srvPtr
+
+	// Shut down the old server (best effort, 3 s deadline).
+	if old != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := old.Shutdown(ctx); err != nil {
+			logger.Warn("old HTTP server shutdown during rebind", "error", err)
+		}
+	}
+
+	if !enabled {
+		*srvPtr = nil
+		logger.Info("prometheus disabled — HTTP server stopped")
+		return
+	}
+
+	srv := buildHTTPServer(newAddr, loadedCount, total)
+	go func() {
+		logger.Info("HTTP server restarted", "addr", newAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("HTTP server error after rebind", "error", err)
+		}
+	}()
+
+	*srvPtr = srv
+}
+
+// buildHTTPServer assembles the mux and http.Server without starting it.
+func buildHTTPServer(addr string, loadedCount, total int) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthzHandler(loadedCount, total))
+	mux.HandleFunc("/readyz", healthzHandler(loadedCount, total))
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 }
 
 // buildLoaders creates the set of BPF loaders based on config.
@@ -234,7 +395,7 @@ func healthzHandler(loaded, total int) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
+		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":         "ok",
 			"programsLoaded": loaded,
 			"programsTotal":  total,

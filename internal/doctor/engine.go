@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/optiqor/kerno/internal/collector"
@@ -79,6 +80,7 @@ type Anomaly struct {
 // Engine orchestrates the full doctor diagnostic pipeline:
 // collect signals → evaluate rules → (optional AI) → render report.
 type Engine struct {
+	mu         sync.RWMutex // protects thresholds for concurrent reload
 	thresholds config.DoctorThresholds
 	analyzer   Analyzer
 	logger     *slog.Logger
@@ -97,12 +99,27 @@ func NewEngine(thresholds config.DoctorThresholds, analyzer Analyzer, logger *sl
 	}
 }
 
+// UpdateThresholds hot-swaps the diagnostic thresholds without restarting
+// the engine. Safe to call from any goroutine (e.g. a SIGHUP handler).
+// The next call to Diagnose will use the new values.
+func (e *Engine) UpdateThresholds(t config.DoctorThresholds) {
+	e.mu.Lock()
+	e.thresholds = t
+	e.mu.Unlock()
+	e.logger.Info("doctor thresholds updated via hot-reload")
+}
+
 // Diagnose runs the full diagnostic pipeline against collected signals.
 func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Report, error) {
 	start := time.Now()
 
+	// Grab a consistent snapshot of thresholds for this run.
+	e.mu.RLock()
+	thresholds := e.thresholds
+	e.mu.RUnlock()
+
 	// Phase 1: Evaluate deterministic rules.
-	findings := Evaluate(signals, e.thresholds)
+	findings := Evaluate(signals, thresholds)
 	e.logger.Debug("rules evaluated",
 		"findings", len(findings),
 		"duration_ms", time.Since(start).Milliseconds(),

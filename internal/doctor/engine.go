@@ -78,10 +78,15 @@ type Anomaly struct {
 }
 
 // Engine orchestrates the full doctor diagnostic pipeline:
-// collect signals → evaluate rules → (optional AI) → render report.
+//
+//	collect signals → evaluate rules → (optional AI enrichment) → render report
 type Engine struct {
-	mu         sync.RWMutex // protects thresholds for concurrent reload
+	// mu protects thresholds so UpdateThresholds (called from the SIGHUP
+	// goroutine) and Diagnose (called from the doctor command goroutine) never
+	// race. RWMutex is used because reads vastly outnumber writes.
+	mu         sync.RWMutex
 	thresholds config.DoctorThresholds
+
 	analyzer   Analyzer
 	logger     *slog.Logger
 	history    []*collector.Signals
@@ -99,9 +104,9 @@ func NewEngine(thresholds config.DoctorThresholds, analyzer Analyzer, logger *sl
 	}
 }
 
-// UpdateThresholds hot-swaps the diagnostic thresholds without restarting
-// the engine. Safe to call from any goroutine (e.g. a SIGHUP handler).
-// The next call to Diagnose will use the new values.
+// UpdateThresholds hot-swaps the diagnostic thresholds without restarting the
+// engine. Safe to call from any goroutine (e.g. a SIGHUP handler). The next
+// call to Diagnose picks up the new values automatically.
 func (e *Engine) UpdateThresholds(t config.DoctorThresholds) {
 	e.mu.Lock()
 	e.thresholds = t
@@ -109,11 +114,13 @@ func (e *Engine) UpdateThresholds(t config.DoctorThresholds) {
 	e.logger.Info("doctor thresholds updated via hot-reload")
 }
 
-// Diagnose runs the full diagnostic pipeline against collected signals.
+// Diagnose runs the full diagnostic pipeline against the supplied signals.
 func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Report, error) {
 	start := time.Now()
 
-	// Grab a consistent snapshot of thresholds for this run.
+	// Take a consistent snapshot of thresholds for this diagnostic run.
+	// Using RLock means concurrent Diagnose calls never block each other;
+	// only a concurrent UpdateThresholds call causes a brief wait.
 	e.mu.RLock()
 	thresholds := e.thresholds
 	e.mu.RUnlock()
@@ -125,7 +132,7 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 
-	// Phase 2: Optional AI enrichment.
+	// Phase 2: Optional AI enrichment (non-fatal on failure).
 	var analysis *AnalysisResponse
 	if e.analyzer != nil && hasActionableFindings(findings) {
 		e.logger.Info("running AI analysis")
@@ -136,12 +143,11 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 			History:  e.history,
 		})
 		if err != nil {
-			// AI failure is non-fatal — log and continue with deterministic results.
 			e.logger.Warn("AI analysis failed, continuing with rule-based results", "error", err)
 		}
 	}
 
-	// Phase 3: Build report.
+	// Phase 3: Build the report.
 	hostname, _ := os.Hostname()
 	report := &Report{
 		Hostname:  hostname,
@@ -152,12 +158,12 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 		Duration:  signals.Duration,
 		Findings:  findings,
 		Analysis:  analysis,
-		// Carry the raw signals through so the JSON renderer can
-		// surface them for debugging — the pretty renderer ignores it.
+		// Raw signals are carried through for the JSON renderer; the
+		// pretty renderer ignores this field.
 		Signals: signals,
 	}
 
-	// Track events collected.
+	// Track event counts for the report summary.
 	if signals.Syscall != nil {
 		report.EventsCollected += signals.Syscall.TotalCount
 	}
@@ -165,7 +171,7 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 		report.EventsCollected += signals.Sched.TotalCount
 	}
 
-	// Phase 4: Append to history ring buffer.
+	// Phase 4: Append to the history ring buffer.
 	e.appendHistory(signals)
 
 	return report, nil
@@ -178,7 +184,8 @@ func (e *Engine) appendHistory(signals *collector.Signals) {
 	}
 }
 
-// hasActionableFindings returns true if there are any WARNING or CRITICAL findings.
+// hasActionableFindings returns true if there is at least one WARNING or
+// CRITICAL finding — the threshold below which AI enrichment is not worthwhile.
 func hasActionableFindings(findings []Finding) bool {
 	for i := range findings {
 		if findings[i].Severity >= SeverityWarning {

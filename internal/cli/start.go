@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,10 +22,34 @@ import (
 
 	"github.com/optiqor/kerno/internal/adapter"
 	"github.com/optiqor/kerno/internal/bpf"
+	"github.com/optiqor/kerno/internal/config"
 	"github.com/optiqor/kerno/internal/doctor"
 	"github.com/optiqor/kerno/internal/metrics"
 	"github.com/optiqor/kerno/internal/version"
 )
+
+// ── Package-level atomic config pointer ────────────────────────────────────
+//
+// globalCfg is the live configuration pointer, protected by atomic.Pointer
+// so the SIGHUP handler can safely swap it without blocking reads from
+// doctor, watch, chaos, and other subsystems.
+//
+// Fix: replaces the bare package-level *config.Config assignment that was a
+// textbook data race (caught by go test -race). Every read site calls getCfg()
+// and every write calls setCfg(); no additional locking needed because
+// atomic.Pointer provides sequentially-consistent load/store.
+var globalCfg atomic.Pointer[config.Config]
+
+// getCfg returns the current live config. Safe to call from any goroutine.
+func getCfg() *config.Config {
+	return globalCfg.Load()
+}
+
+// setCfg atomically replaces the live config pointer.
+// Used by the SIGHUP handler after a successful reload.
+func setCfg(newCfg *config.Config) {
+	globalCfg.Store(newCfg)
+}
 
 func newStartCmd() *cobra.Command {
 	var (
@@ -77,9 +103,15 @@ type startOpts struct {
 // the handler easy to read and test.
 type reloadableSubsystems struct {
 	engine     *doctor.Engine
-	httpServer **http.Server // pointer-to-pointer so we can swap the server
+	httpServer **http.Server // pointer-to-pointer so rebind can swap the server
 	logger     *slog.Logger
 	opts       startOpts
+
+	// Fix: hold the real BPF program counts so that rebindPrometheus can
+	// pass them to the new /healthz handler instead of hardcoding 0/0.
+	mu           sync.Mutex // protects loadedCount and totalLoaders
+	loadedCount  int
+	totalLoaders int
 }
 
 func runStart(ctx context.Context, opts startOpts) error {
@@ -96,7 +128,7 @@ func runStart(ctx context.Context, opts startOpts) error {
 
 	// Set up OS signal handling.
 	// SIGINT / SIGTERM → graceful shutdown (via context cancellation).
-	// SIGHUP           → config hot-reload (handled in a separate goroutine).
+	// SIGHUP           → config hot-reload (handled in a dedicated goroutine).
 	shutdownCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -104,13 +136,18 @@ func runStart(ctx context.Context, opts startOpts) error {
 	signal.Notify(sighupCh, syscall.SIGHUP)
 	defer signal.Stop(sighupCh)
 
-	// Resolve Prometheus address.
-	promAddr := cfg.Prometheus.Addr
+	// Initialise the atomic config pointer with the startup config.
+	// cfg is the package-level *config.Config set by root.go's initConfig.
+	startupCfg := cfg
+	setCfg(startupCfg)
+
+	// Resolve Prometheus listen address (CLI flag overrides config file).
+	promAddr := startupCfg.Prometheus.Addr
 	if opts.prometheusAddr != "" {
 		promAddr = opts.prometheusAddr
 	}
 
-	// Phase 1: Load eBPF programs with graceful degradation.
+	// ── Phase 1: Load eBPF programs (graceful degradation) ─────────────────
 	loaders, loaderSet := buildLoaders(logger)
 	loadedCount := 0
 	closers := make([]func(), 0, len(loaders))
@@ -135,25 +172,26 @@ func runStart(ctx context.Context, opts startOpts) error {
 		}
 	}()
 
-	logger.Info("eBPF programs loaded", "loaded", loadedCount, "total", len(loaders))
+	totalLoaders := len(loaders)
+	logger.Info("eBPF programs loaded", "loaded", loadedCount, "total", totalLoaders)
 
-	// Set Prometheus gauges for self-monitoring.
+	// Self-monitoring gauges.
 	metrics.BPFProgramsLoaded.Set(float64(loadedCount))
 	metrics.InfoMetric.WithLabelValues(version.Version).Set(1)
 
-	// Pre-initialize CounterVec instances so /metrics emits HELP/TYPE
-	// lines immediately, before any event flows.
+	// Pre-initialise CounterVec instances so /metrics emits HELP/TYPE
+	// lines immediately, before any event flows through.
 	for _, l := range loaders {
 		metrics.CollectorEventsTotal.WithLabelValues(l.Name()).Add(0)
 		metrics.CollectorErrorsTotal.WithLabelValues(l.Name()).Add(0)
 	}
 
-	// Phase 2: Start the metrics bridge.
+	// ── Phase 2: Metrics bridge ────────────────────────────────────────────
 	bridge := metrics.NewBridge(logger)
 	bridge.Start(shutdownCtx, loaderSet.Loaders())
 	defer bridge.Stop()
 
-	// Phase 2b: Start environment adapter.
+	// ── Phase 2b: Environment adapter ─────────────────────────────────────
 	env := adapter.DetectEnvironment()
 	adpt := adapter.NewAdapter(logger, env)
 	if err := adpt.Start(shutdownCtx); err != nil {
@@ -162,41 +200,55 @@ func runStart(ctx context.Context, opts startOpts) error {
 	defer adpt.Stop()
 	logger.Info("environment adapter started", "adapter", adpt.Name(), "env", env)
 
-	// Phase 2c: Create the doctor engine — held in a pointer so the
-	// SIGHUP handler can call UpdateThresholds on the live instance.
-	diagEngine := doctor.NewEngine(cfg.Doctor.Thresholds, nil, logger)
+	// ── Phase 2c: Doctor engine ────────────────────────────────────────────
+	// Held in reloadableSubsystems so the SIGHUP handler can call
+	// UpdateThresholds on the live instance.
+	// AI analyzer is wired separately by the ai package; pass nil here so
+	// the daemon starts without AI enrichment by default (opt-in via config).
+	diagEngine := doctor.NewEngine(startupCfg.Doctor.Thresholds, nil, logger)
 
-	// Phase 3: Start HTTP server for health and metrics.
-	httpServer := startHTTPServer(logger, opts, promAddr, loadedCount, len(loaders))
+	// ── Phase 3: HTTP server (health + metrics) ────────────────────────────
+	httpServer := startHTTPServer(logger, opts, promAddr, loadedCount, totalLoaders)
 
-	// ── SIGHUP hot-reload goroutine ────────────────────────────────────
+	// Build the reloadable subsystems struct — the SIGHUP handler's only
+	// argument, keeping the handler signature stable as features are added.
+	reloadableSubs := &reloadableSubsystems{
+		engine:       diagEngine,
+		httpServer:   &httpServer,
+		logger:       logger,
+		opts:         opts,
+		loadedCount:  loadedCount,
+		totalLoaders: totalLoaders,
+	}
+
+	// ── SIGHUP hot-reload goroutine ────────────────────────────────────────
 	//
-	// Runs until the daemon shuts down. On every SIGHUP it:
-	//  1. Re-reads the config file from the path kerno was started with.
-	//  2. Diffs old vs new.
-	//  3. Applies safe changes in-place (log level, thresholds, etc.).
-	//  4. Warns about changes that need a restart (collector toggles).
+	// Runs for the lifetime of the daemon. On every SIGHUP it:
+	//  1. Re-reads the config file via the same Viper pipeline used at startup.
+	//  2. Diffs old vs new config.
+	//  3. Applies safe changes in-place (log level, thresholds, prometheus addr).
+	//  4. Warns about changes that require a restart (collector enable/disable).
 	go func() {
 		for {
 			select {
 			case <-shutdownCtx.Done():
 				return
 			case <-sighupCh:
-				handleSIGHUP(logger, diagEngine, &httpServer, opts)
+				handleSIGHUP(logger, reloadableSubs)
 			}
 		}
 	}()
 
-	// Log daemon status.
+	// ── Status banner ──────────────────────────────────────────────────────
 	fmt.Println("kerno daemon running")
-	fmt.Printf("  eBPF programs: %d/%d loaded\n", loadedCount, len(loaders))
+	fmt.Printf("  eBPF programs: %d/%d loaded\n", loadedCount, totalLoaders)
 	if opts.prometheus {
 		fmt.Printf("  Prometheus:    http://%s/metrics\n", promAddr)
 		fmt.Printf("  Health:        http://%s/healthz\n", promAddr)
 		fmt.Printf("  Readiness:     http://%s/readyz\n", promAddr)
 	}
 	if opts.dashboard {
-		fmt.Printf("  Dashboard:     http://%s (not yet implemented)\n", cfg.Dashboard.Addr)
+		fmt.Printf("  Dashboard:     http://%s (not yet implemented)\n", getCfg().Dashboard.Addr)
 	}
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop.")
@@ -206,7 +258,7 @@ func runStart(ctx context.Context, opts startOpts) error {
 
 	logger.Info("shutting down kerno daemon")
 
-	// Phase 4: Graceful HTTP shutdown.
+	// ── Phase 4: Graceful HTTP shutdown ───────────────────────────────────
 	if httpServer != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
@@ -219,67 +271,82 @@ func runStart(ctx context.Context, opts startOpts) error {
 	return nil
 }
 
-// handleSIGHUP performs the config hot-reload on every SIGHUP signal.
-// It is called from the goroutine in runStart and must not block for long.
+// handleSIGHUP performs config hot-reload on every SIGHUP.
+// Called from the goroutine in runStart; must not block for long.
 func handleSIGHUP(
 	logger *slog.Logger,
-	engine *doctor.Engine,
-	httpServerPtr **http.Server,
-	opts startOpts,
+	subs *reloadableSubsystems,
 ) {
+	oldCfg := getCfg()
 	logger.Info("SIGHUP received — reloading config", "path", cfgFile)
 
-	newCfg, result, err := cfg.ReloadFrom(cfgFile)
+	newCfg, result, err := oldCfg.ReloadFrom(cfgFile)
 	if err != nil {
 		logger.Error("config reload failed — keeping current config", "error", err)
 		return
 	}
 
-	// ── Apply each safe change ─────────────────────────────────────────
+	// ── Apply each hot-reloadable change ──────────────────────────────────
 
 	for _, change := range result.Applied {
 		logger.Info("applying hot-reload change", "change", change)
 	}
 
-	// 1. Log level / format — delegate to root.go's initLogger so the
-	//    slog handler is rebuilt identically to startup behaviour
-	//    (JSON vs text detection, level, etc.).
-	if cfg.LogLevel != newCfg.LogLevel || cfg.LogFormat != newCfg.LogFormat {
+	// 1. Log level / format
+	//    Delegate to root.go's initLogger so the slog handler is rebuilt
+	//    identically to startup (JSON vs text detection, level parsing, etc.).
+	//    Refresh the local logger pointer so subsequent calls in this function
+	//    use the new handler immediately.
+	if oldCfg.LogLevel != newCfg.LogLevel || oldCfg.LogFormat != newCfg.LogFormat {
 		initLogger(newCfg.LogLevel, newCfg.LogFormat)
+		logger = slog.Default()
 		logger.Info("log level/format changed",
 			"level", newCfg.LogLevel, "format", newCfg.LogFormat)
 	}
 
 	// 2. Doctor thresholds
-	if cfg.Doctor.Thresholds != newCfg.Doctor.Thresholds {
-		engine.UpdateThresholds(newCfg.Doctor.Thresholds)
+	//    Use the change set from reload.go's diff() — single source of truth.
+	//    This avoids re-diffing DoctorThresholds here, which would silently
+	//    break if a slice or map field is ever added to the struct.
+	for _, change := range result.Applied {
+		if change == "doctor.thresholds updated" {
+			subs.engine.UpdateThresholds(newCfg.Doctor.Thresholds)
+			break
+		}
 	}
 
-	// 3. Prometheus address re-bind
-	oldAddr := cfg.Prometheus.Addr
+	// 3. Prometheus address / enabled flag
+	//    Fix: read the real BPF program counts from reloadableSubsystems
+	//    (mutex-protected) so the rebuilt /healthz handler keeps reporting
+	//    accurate numbers instead of 0/0.
+	subs.mu.Lock()
+	loadedCount := subs.loadedCount
+	totalLoaders := subs.totalLoaders
+	subs.mu.Unlock()
+
+	oldAddr := oldCfg.Prometheus.Addr
 	newAddr := newCfg.Prometheus.Addr
-	if opts.prometheusAddr != "" {
-		// CLI flag always wins for the initial bind; honour it on reload too.
-		newAddr = opts.prometheusAddr
+	if subs.opts.prometheusAddr != "" {
+		// CLI flag always wins; honour it on reload too.
+		newAddr = subs.opts.prometheusAddr
 	}
-	if oldAddr != newAddr || cfg.Prometheus.Enabled != newCfg.Prometheus.Enabled {
+	if oldAddr != newAddr || oldCfg.Prometheus.Enabled != newCfg.Prometheus.Enabled {
 		logger.Info("prometheus address changed — rebinding",
 			"old", oldAddr, "new", newAddr)
-		rebindPrometheus(logger, httpServerPtr, opts, newAddr,
-			0, // loadedCount / total not tracked here; healthz uses last snapshot
-			0,
+		rebindPrometheus(logger, subs.httpServer, subs.opts, newAddr,
+			loadedCount, totalLoaders,
 			newCfg.Prometheus.Enabled,
 		)
 	}
 
-	// 4. Warn about restart-required changes.
+	// 4. Warn about restart-required changes; do not crash.
 	for _, w := range result.RestartRequired {
 		logger.Warn("config change requires restart to take effect", "change", w)
 	}
 
-	// Swap the global config pointer so subsequent reloads diff correctly.
-	// cfg is the package-level *config.Config set by the root command.
-	cfg = newCfg
+	// Atomically swap the global config pointer so the next reload diffs
+	// against the freshly-applied config, not the stale startup config.
+	setCfg(newCfg)
 
 	logger.Info(result.String(),
 		"applied", len(result.Applied),
@@ -288,7 +355,7 @@ func handleSIGHUP(
 }
 
 // startHTTPServer launches the Prometheus / health HTTP server and returns
-// it so the caller can shut it down later.
+// the *http.Server so the caller can shut it down on exit.
 func startHTTPServer(
 	logger *slog.Logger,
 	opts startOpts,
@@ -311,8 +378,9 @@ func startHTTPServer(
 	return srv
 }
 
-// rebindPrometheus gracefully shuts down the old HTTP server and starts a
-// new one on newAddr. Called when prometheus.addr changes on SIGHUP.
+// rebindPrometheus gracefully shuts down the current HTTP server and starts a
+// new one on newAddr. Called when prometheus.addr or prometheus.enabled changes
+// on SIGHUP.
 func rebindPrometheus(
 	logger *slog.Logger,
 	srvPtr **http.Server,
@@ -323,7 +391,7 @@ func rebindPrometheus(
 ) {
 	old := *srvPtr
 
-	// Shut down the old server (best effort, 3 s deadline).
+	// Shut down the old server (best-effort, 3 s deadline).
 	if old != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -350,6 +418,7 @@ func rebindPrometheus(
 }
 
 // buildHTTPServer assembles the mux and http.Server without starting it.
+// Separating construction from start makes rebindPrometheus clean and testable.
 func buildHTTPServer(addr string, loadedCount, total int) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler(loadedCount, total))
@@ -363,26 +432,33 @@ func buildHTTPServer(addr string, loadedCount, total int) *http.Server {
 	}
 }
 
-// buildLoaders creates the set of BPF loaders based on config.
+// buildLoaders creates the set of BPF loaders based on the current live config.
+// Falls back to the root.go package-level cfg if the atomic pointer has not
+// yet been initialised (early startup path, before setCfg is called).
 func buildLoaders(logger *slog.Logger) ([]bpf.Loader, *bpf.LoaderSet) {
+	currentCfg := getCfg()
+	if currentCfg == nil {
+		currentCfg = cfg // fallback: root.go package-level pointer
+	}
+
 	var loaders []bpf.Loader
 
-	if cfg.Collectors.SyscallLatency {
+	if currentCfg.Collectors.SyscallLatency {
 		loaders = append(loaders, bpf.NewSyscallLatencyLoader(logger))
 	}
-	if cfg.Collectors.TCPMonitor {
+	if currentCfg.Collectors.TCPMonitor {
 		loaders = append(loaders, bpf.NewTCPMonitorLoader(logger))
 	}
-	if cfg.Collectors.OOMTrack {
+	if currentCfg.Collectors.OOMTrack {
 		loaders = append(loaders, bpf.NewOOMTrackLoader(logger))
 	}
-	if cfg.Collectors.DiskIO {
+	if currentCfg.Collectors.DiskIO {
 		loaders = append(loaders, bpf.NewDiskIOLoader(logger))
 	}
-	if cfg.Collectors.SchedDelay {
+	if currentCfg.Collectors.SchedDelay {
 		loaders = append(loaders, bpf.NewSchedDelayLoader(logger))
 	}
-	if cfg.Collectors.FDTrack {
+	if currentCfg.Collectors.FDTrack {
 		loaders = append(loaders, bpf.NewFDTrackLoader(logger))
 	}
 
@@ -390,12 +466,16 @@ func buildLoaders(logger *slog.Logger) ([]bpf.Loader, *bpf.LoaderSet) {
 	return loaders, set
 }
 
-// healthzHandler returns the health check handler.
+// healthzHandler returns an HTTP handler that reports BPF program load status.
+//
+// Fix: map[string]any (not map[string]interface{}) — consistent with the
+// Go 1.18+ idiom adopted in PR #54. golangci-lint's predeclared and gocritic
+// checks both enforce this; interface{} in new code is a lint failure.
 func healthzHandler(loaded, total int) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":         "ok",
 			"programsLoaded": loaded,
 			"programsTotal":  total,

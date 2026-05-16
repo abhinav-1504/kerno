@@ -333,7 +333,7 @@ func handleSIGHUP(
 	if oldAddr != newAddr || oldCfg.Prometheus.Enabled != newCfg.Prometheus.Enabled {
 		logger.Info("prometheus address changed — rebinding",
 			"old", oldAddr, "new", newAddr)
-		rebindPrometheus(logger, subs.httpServer, subs.opts, newAddr,
+		rebindPrometheus(logger, subs.httpServer, newAddr,
 			loadedCount, totalLoaders,
 			newCfg.Prometheus.Enabled,
 		)
@@ -381,10 +381,12 @@ func startHTTPServer(
 // rebindPrometheus gracefully shuts down the current HTTP server and starts a
 // new one on newAddr. Called when prometheus.addr or prometheus.enabled changes
 // on SIGHUP.
+//
+// Fix: removed the unused opts startOpts parameter (unparam lint failure).
+// The enabled bool is passed explicitly; all other needed state is in srvPtr.
 func rebindPrometheus(
 	logger *slog.Logger,
 	srvPtr **http.Server,
-	opts startOpts,
 	newAddr string,
 	loadedCount, total int,
 	enabled bool,

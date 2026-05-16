@@ -178,7 +178,9 @@ func TestConfigDiff(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc // capture loop variable for t.Parallel()
+		// Fix: removed `tc := tc` loop-variable copy — redundant in Go 1.22+
+		// where loop variables are re-bound per iteration automatically.
+		// The copyloopvar golangci-lint check flags the old pattern.
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 

@@ -66,7 +66,6 @@ func (c *Config) ReloadFrom(path string) (*Config, ReloadResult, error) {
 func parseConfig(path string) (*Config, error) {
 	v := viper.New()
 
-	// Config file discovery — same logic as initConfig in root.go.
 	resolved := path
 	if resolved == "" {
 		resolved = os.Getenv("KERNO_CONFIG")
@@ -81,7 +80,6 @@ func parseConfig(path string) (*Config, error) {
 		v.AddConfigPath(".")
 	}
 
-	// Environment variable support — same prefix/replacer as root.go.
 	v.SetEnvPrefix("KERNO")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	v.AutomaticEnv()
@@ -105,36 +103,31 @@ func parseConfig(path string) (*Config, error) {
 // diff compares two configs and classifies every changed field into
 // "can hot-apply" vs "needs restart".
 //
-// Design note: all diffing logic lives here — the SIGHUP handler in start.go
-// consumes result.Applied and result.RestartRequired without re-diffing, so
-// there is a single source of truth. Adding a new config field means updating
-// exactly one place (this function) and one test (reload_test.go).
-//
-// Fix: renamed parameter from `new` to `next` — `new` is a predeclared
-// Go identifier; using it as a parameter name triggers the predeclared lint
-// check enabled in this repo's golangci-lint config.
+// All diffing logic lives here so the SIGHUP handler in start.go consumes
+// result.Applied and result.RestartRequired without re-diffing. Adding a new
+// config field means updating exactly one place (this function) and one test
+// (reload_test.go).
 func diff(old, next *Config) ReloadResult {
 	var r ReloadResult
 
-	// ── Always reloadable ──────────────────────────────────────────────────
-
+	// Always reloadable.
 	if old.LogLevel != next.LogLevel {
-		r.Applied = append(r.Applied, fmt.Sprintf("log_level: %q → %q", old.LogLevel, next.LogLevel))
+		r.Applied = append(r.Applied, fmt.Sprintf("log_level: %q -> %q", old.LogLevel, next.LogLevel))
 	}
 	if old.LogFormat != next.LogFormat {
-		r.Applied = append(r.Applied, fmt.Sprintf("log_format: %q → %q", old.LogFormat, next.LogFormat))
+		r.Applied = append(r.Applied, fmt.Sprintf("log_format: %q -> %q", old.LogFormat, next.LogFormat))
 	}
 	if old.Prometheus.Addr != next.Prometheus.Addr {
-		r.Applied = append(r.Applied, fmt.Sprintf("prometheus.addr: %q → %q", old.Prometheus.Addr, next.Prometheus.Addr))
+		r.Applied = append(r.Applied, fmt.Sprintf("prometheus.addr: %q -> %q", old.Prometheus.Addr, next.Prometheus.Addr))
 	}
 	if old.Prometheus.Enabled != next.Prometheus.Enabled {
-		r.Applied = append(r.Applied, fmt.Sprintf("prometheus.enabled: %v → %v", old.Prometheus.Enabled, next.Prometheus.Enabled))
+		r.Applied = append(r.Applied, fmt.Sprintf("prometheus.enabled: %v -> %v", old.Prometheus.Enabled, next.Prometheus.Enabled))
 	}
 	if !reflect.DeepEqual(old.Doctor.Thresholds, next.Doctor.Thresholds) {
 		r.Applied = append(r.Applied, "doctor.thresholds updated")
 	}
 	if old.Doctor.Duration != next.Doctor.Duration {
-		r.Applied = append(r.Applied, fmt.Sprintf("doctor.duration: %s → %s", old.Doctor.Duration, next.Doctor.Duration))
+		r.Applied = append(r.Applied, fmt.Sprintf("doctor.duration: %s -> %s", old.Doctor.Duration, next.Doctor.Duration))
 	}
 	if !reflect.DeepEqual(old.AI, next.AI) {
 		r.Applied = append(r.Applied, "ai config updated")
@@ -146,35 +139,34 @@ func diff(old, next *Config) ReloadResult {
 		r.Applied = append(r.Applied, "kubernetes config updated")
 	}
 
-	// ── Requires restart (BPF programs already loaded) ─────────────────────
-
+	// Requires restart because BPF programs are already loaded.
 	if old.Collectors.SyscallLatency != next.Collectors.SyscallLatency {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.syscall_latency: %v → %v", old.Collectors.SyscallLatency, next.Collectors.SyscallLatency))
+			fmt.Sprintf("collectors.syscall_latency: %v -> %v", old.Collectors.SyscallLatency, next.Collectors.SyscallLatency))
 	}
 	if old.Collectors.TCPMonitor != next.Collectors.TCPMonitor {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.tcp_monitor: %v → %v", old.Collectors.TCPMonitor, next.Collectors.TCPMonitor))
+			fmt.Sprintf("collectors.tcp_monitor: %v -> %v", old.Collectors.TCPMonitor, next.Collectors.TCPMonitor))
 	}
 	if old.Collectors.OOMTrack != next.Collectors.OOMTrack {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.oom_track: %v → %v", old.Collectors.OOMTrack, next.Collectors.OOMTrack))
+			fmt.Sprintf("collectors.oom_track: %v -> %v", old.Collectors.OOMTrack, next.Collectors.OOMTrack))
 	}
 	if old.Collectors.DiskIO != next.Collectors.DiskIO {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.disk_io: %v → %v", old.Collectors.DiskIO, next.Collectors.DiskIO))
+			fmt.Sprintf("collectors.disk_io: %v -> %v", old.Collectors.DiskIO, next.Collectors.DiskIO))
 	}
 	if old.Collectors.SchedDelay != next.Collectors.SchedDelay {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.sched_delay: %v → %v", old.Collectors.SchedDelay, next.Collectors.SchedDelay))
+			fmt.Sprintf("collectors.sched_delay: %v -> %v", old.Collectors.SchedDelay, next.Collectors.SchedDelay))
 	}
 	if old.Collectors.FDTrack != next.Collectors.FDTrack {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.fd_track: %v → %v", old.Collectors.FDTrack, next.Collectors.FDTrack))
+			fmt.Sprintf("collectors.fd_track: %v -> %v", old.Collectors.FDTrack, next.Collectors.FDTrack))
 	}
 	if old.Collectors.FileAudit != next.Collectors.FileAudit {
 		r.RestartRequired = append(r.RestartRequired,
-			fmt.Sprintf("collectors.file_audit: %v → %v", old.Collectors.FileAudit, next.Collectors.FileAudit))
+			fmt.Sprintf("collectors.file_audit: %v -> %v", old.Collectors.FileAudit, next.Collectors.FileAudit))
 	}
 
 	return r

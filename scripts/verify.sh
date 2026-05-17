@@ -74,23 +74,29 @@ phase_build() {
     echo "==> 2. build pipeline"
     local n=$1
 
-    if go generate ./internal/bpf/... >/tmp/verify-generate.log 2>&1; then
+    # make generate runs bpf2go and post-processes build tags so that the
+    # generated *_bpfel.go files require the 'ebpf' tag and do not conflict
+    # with gen_stub.go. Using 'go generate ./internal/bpf/...' directly skips
+    # that post-processing and breaks the build-tag invariant.
+    if make generate >/tmp/verify-generate.log 2>&1; then
         local count
         count=$(ls internal/bpf/*_bpfel.go 2>/dev/null | wc -l)
         if [[ "$count" -eq 6 ]]; then
-            phase_pass "$n" "go generate produced 6/6 *_bpfel.go files"
+            phase_pass "$n" "make generate produced 6/6 *_bpfel.go files"
         else
-            phase_fail "$n" "go generate produced $count/6 *_bpfel.go files"
+            phase_fail "$n" "make generate produced $count/6 *_bpfel.go files"
         fi
     else
-        phase_fail "$n" "go generate failed (see /tmp/verify-generate.log)"
+        phase_fail "$n" "make generate failed (see /tmp/verify-generate.log)"
         return 1
     fi
 
-    if make build >/tmp/verify-build.log 2>&1; then
-        phase_pass "$n" "make build succeeded → $($KERNO version | head -1)"
+    # make build-ebpf compiles with the 'ebpf' tag so real BPF programs are
+    # linked in. 'make build' produces the stub binary and cannot load BPF.
+    if make build-ebpf >/tmp/verify-build.log 2>&1; then
+        phase_pass "$n" "make build-ebpf succeeded → $($KERNO version | head -1)"
     else
-        phase_fail "$n" "make build failed"
+        phase_fail "$n" "make build-ebpf failed"
     fi
 
     if go build -o "$BPF_VERIFY" ./cmd/bpf-verify >/dev/null 2>&1; then
@@ -312,7 +318,7 @@ phase_induce_detect() {
     done
 }
 
-# ─── Daemon phase (includes SIGHUP hot-reload test) ───────────────────────
+# Daemon phase (includes SIGHUP hot-reload test).
 
 phase_daemon() {
     echo "==> 10. daemon mode"
@@ -363,19 +369,15 @@ phase_daemon() {
         phase_fail "$n" "/metrics has no kerno_ metrics at all"
     fi
 
-    # ── SIGHUP hot-reload test ─────────────────────────────────────────
-    #
-    # 1. Write a new config with a different log_level and a tighter
-    #    doctor threshold.
+    # SIGHUP hot-reload test:
+    # 1. Write a new config with a different log_level and tighter thresholds.
     # 2. Send SIGHUP to the daemon.
     # 3. Wait briefly for the reload to settle.
-    # 4. Scrape /metrics and verify a config-driven label changed, OR
-    #    check the daemon log for the reload success message.
+    # 4. Check the daemon log for the reload success message.
     # 5. Verify the daemon is still alive (no crash).
 
     echo "     [SIGHUP hot-reload]"
 
-    # Write a modified config — lower log level, tighter syscall threshold.
     cat >/tmp/verify-sighup-config.yaml <<'YAML'
 log_level: debug
 log_format: json
@@ -398,18 +400,12 @@ ai:
   enabled: false
 YAML
 
-    # Copy it over the config kerno was started with (verify-config.yaml
-    # is the path the daemon reads on SIGHUP via --config flag or default).
-    # We use a temp path; in the real deployment this would be /etc/kerno/config.yaml.
     cp /tmp/verify-sighup-config.yaml /tmp/verify-active-config.yaml
 
-    # Send SIGHUP.
     sudo kill -HUP "$dpid" 2>/dev/null
 
-    # Give the daemon up to 3 seconds to reload.
     sleep 3
 
-    # The daemon must still be alive.
     if sudo kill -0 "$dpid" 2>/dev/null; then
         phase_pass "$n" "daemon still alive after SIGHUP (no crash)"
     else
@@ -417,7 +413,6 @@ YAML
         return 1
     fi
 
-    # The daemon log should contain the reload success line.
     if grep -q "config reloaded" /tmp/verify-daemon.log 2>/dev/null; then
         local applied
         applied=$(grep "config reloaded" /tmp/verify-daemon.log | tail -1)
@@ -426,29 +421,25 @@ YAML
         phase_fail "$n" "SIGHUP: 'config reloaded' not found in daemon log"
     fi
 
-    # The daemon log should show log_level flip to debug.
     if grep -q "log level changed" /tmp/verify-daemon.log 2>/dev/null; then
         phase_pass "$n" "SIGHUP: log level hot-swap confirmed in daemon log"
     else
-        # Not fatal — the message may be absent if log level was already debug.
         phase_skip "$n" "SIGHUP: log level change line not found (may already be debug)"
     fi
 
-    # /metrics must still respond after reload.
     if curl -sf "localhost:$port/metrics" >/dev/null 2>/dev/null; then
         phase_pass "$n" "SIGHUP: /metrics still responsive after reload"
     else
         phase_fail "$n" "SIGHUP: /metrics not responding after reload"
     fi
 
-    # systemd ExecReload path: verify the unit file has ExecReload=/bin/kill -HUP $MAINPID
     if grep -q "ExecReload=/bin/kill -HUP" deploy/systemd/kerno.service; then
         phase_pass "$n" "kerno.service has ExecReload=/bin/kill -HUP \$MAINPID"
     else
         phase_fail "$n" "kerno.service missing ExecReload line"
     fi
 
-    # ── Graceful shutdown ──────────────────────────────────────────────
+    # Graceful shutdown.
     sudo kill -INT "$dpid" 2>/dev/null || true
     local stopped=0
     for i in 1 2 3 4 5; do
@@ -749,7 +740,7 @@ for r in "${RESULTS[@]}"; do
     esac
 done
 
-echo "═══════════════════════════════════════════════════════════════════"
+echo "==================================================================="
 echo "Verification Summary"
 echo "  Phases run:    ${#SELECTED[@]}"
 echo "  Checks passed: $PASS"

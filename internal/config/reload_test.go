@@ -25,7 +25,7 @@ func TestConfigDiff(t *testing.T) {
 		expectApplied []string // substrings that must appear in result.Applied
 		expectRestart bool     // true → at least one entry in RestartRequired expected
 	}{
-		// ── Log level / format (always reloadable) ─────────────────────────
+		// Log level / format (always reloadable)
 		{
 			name:          "log_level changes",
 			mutate:        func(c *Config) { c.LogLevel = "debug" },
@@ -37,7 +37,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"log_format"},
 		},
 
-		// ── Prometheus (hot-reloadable) ────────────────────────────────────
+		// Prometheus (hot-reloadable)
 		{
 			name:          "prometheus.addr changes",
 			mutate:        func(c *Config) { c.Prometheus.Addr = ":9091" },
@@ -49,7 +49,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"prometheus.enabled"},
 		},
 
-		// ── Doctor thresholds (hot-reloadable) ────────────────────────────
+		// Doctor thresholds (hot-reloadable)
 		{
 			name: "doctor.thresholds updated",
 			mutate: func(c *Config) {
@@ -65,7 +65,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"doctor.duration"},
 		},
 
-		// ── AI config (hot-reloadable) ─────────────────────────────────────
+		// AI config (hot-reloadable)
 		{
 			name: "ai config updated",
 			mutate: func(c *Config) {
@@ -74,7 +74,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"ai config"},
 		},
 
-		// ── Dashboard config (hot-reloadable) ─────────────────────────────
+		//  Dashboard config (hot-reloadable)
 		{
 			name: "dashboard config updated",
 			mutate: func(c *Config) {
@@ -83,7 +83,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"dashboard config"},
 		},
 
-		// ── Kubernetes config (hot-reloadable) ────────────────────────────
+		//  Kubernetes config (hot-reloadable)
 		{
 			name: "kubernetes config updated",
 			mutate: func(c *Config) {
@@ -92,7 +92,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"kubernetes config"},
 		},
 
-		// ── Collector toggles (RESTART REQUIRED) ──────────────────────────
+		//  Collector toggles (RESTART REQUIRED)
 		// Each collector is tied to a BPF program that has already been loaded;
 		// toggling it at runtime would require unloading / reloading the program,
 		// which is intentionally not supported. diff() must put these in
@@ -147,13 +147,13 @@ func TestConfigDiff(t *testing.T) {
 			expectRestart: true,
 		},
 
-		// ── Sanity: no changes ─────────────────────────────────────────────
+		//  Sanity: no changes
 		{
 			name:   "no changes — both lists empty",
 			mutate: func(_ *Config) {}, // identity mutation
 		},
 
-		// ── Sanity: multiple reloadable changes ────────────────────────────
+		//  Sanity: multiple reloadable changes
 		{
 			name: "multiple reloadable changes",
 			mutate: func(c *Config) {
@@ -163,7 +163,7 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"log_level", "prometheus.addr"},
 		},
 
-		// ── Sanity: mixed reloadable + restart-required ────────────────────
+		//  Sanity: mixed reloadable + restart-required
 		{
 			name: "reloadable + restart-required mix",
 			mutate: func(c *Config) {
@@ -190,7 +190,7 @@ func TestConfigDiff(t *testing.T) {
 
 			result := diff(old, next)
 
-			// ── Applied assertions ─────────────────────────────────────────
+			//  Applied assertions
 			if len(tc.expectApplied) > 0 {
 				if len(result.Applied) == 0 {
 					t.Fatalf("expected Applied changes but got none")
@@ -209,12 +209,12 @@ func TestConfigDiff(t *testing.T) {
 				}
 			}
 
-			// ── No unexpected Applied entries ──────────────────────────────
+			//  No unexpected Applied entries
 			if len(tc.expectApplied) == 0 && !tc.expectRestart && len(result.Applied) > 0 {
 				t.Errorf("expected no Applied changes but got: %v", result.Applied)
 			}
 
-			// ── RestartRequired assertions ─────────────────────────────────
+			// RestartRequired assertions
 			if tc.expectRestart && len(result.RestartRequired) == 0 {
 				t.Errorf("expected RestartRequired changes but got none")
 			}

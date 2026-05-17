@@ -28,7 +28,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/kerno start
 
-# ── Hot-reload via SIGHUP ──────────────────────────────────────────────
+# Hot-reload via SIGHUP 
 # `systemctl reload kerno` sends SIGHUP to the main process.
 # Kerno re-reads /etc/kerno/config.yaml and applies safe changes live
 # (log level, doctor thresholds, prometheus address, AI config).
@@ -39,7 +39,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# ── Security hardening ─────────────────────────────────────────────────
+# Security hardening
 # Kerno needs elevated privileges for eBPF, but we lock down everything else.
 User=root
 Group=root
@@ -65,17 +65,17 @@ ReadOnlyPaths=/proc /sys /dev/kmsg /var/log
 # Allow writing to BPF filesystem for map pinning.
 ReadWritePaths=/sys/fs/bpf
 
-# ── Resource limits ────────────────────────────────────────────────────
+# Resource limits 
 MemoryMax=512M
 CPUQuota=100%
 TasksMax=256
 
-# ── Logging ────────────────────────────────────────────────────────────
+# Logging 
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=kerno
 
-# ── Environment ────────────────────────────────────────────────────────
+# Environment 
 # Config file location (optional — kerno works with zero config).
 Environment=KERNO_LOG_FORMAT=json
 EnvironmentFile=-/etc/kerno/env

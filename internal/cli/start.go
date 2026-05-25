@@ -12,6 +12,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
+	"runtime/debug"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/optiqor/kerno/internal/adapter"
+	"github.com/optiqor/kerno/internal/audit"
 	"github.com/optiqor/kerno/internal/bpf"
 	"github.com/optiqor/kerno/internal/metrics"
 	"github.com/optiqor/kerno/internal/version"
@@ -35,14 +39,8 @@ func newStartCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start Kerno as a long-running daemon with all collectors",
 		Long: `Start Kerno in daemon mode: loads all eBPF programs, starts collectors,
-and exposes Prometheus metrics and an optional web dashboard.
-
-This is the command used in the Kubernetes DaemonSet and for
-long-running observability on standalone servers.`,
-		Example: `  # Start with Prometheus metrics
-  sudo kerno start
-
-  # Start with custom Prometheus address
+and exposes Prometheus metrics and an optional web dashboard.`,
+		Example: `  sudo kerno start
   sudo kerno start --prometheus-addr :9091
 
   # Start with web dashboard
@@ -78,16 +76,65 @@ func runStart(ctx context.Context, opts startOpts) error {
 
 	logger := slog.Default()
 
+	// Phase 0: Audit logger
+	auditLog, err := audit.New(audit.Config{
+		FilePath:   cfg.Audit.FilePath,
+		MaxSizeMB:  cfg.Audit.MaxSizeMB,
+		MaxBackups: cfg.Audit.MaxBackups,
+		Stderr:     cfg.Audit.Stderr,
+	})
+	if err != nil {
+		logger.Error("failed to initialise audit logger; audit events will be lost", "error", err)
+		auditLog = audit.Noop()
+	}
+
+	// daemon.panic recovery — stack digest audit log mein, full trace stderr mein.
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			logger.Error("daemon panic recovered", "panic", r, "stack", string(stack))
+			auditLog.RecordPanic(version.Version, stack)
+			panic(r) // re-panic — process must exit non-zero
+		}
+	}()
+
+	// daemon.start — pehli auditable event.
+	auditLog.Record("kerno/start", audit.EventDaemonStart, audit.DaemonDetails{
+		Version: version.Version,
+	})
+
+	// daemon.stop — hamesha last auditable event hogi.
+	defer auditLog.Record("kerno/start", audit.EventDaemonStop, audit.DaemonDetails{
+		Version: version.Version,
+	})
+
 	logger.Info("starting kerno daemon",
 		"prometheus", opts.prometheus,
 		"dashboard", opts.dashboard,
+		"version", version.Version,
 	)
 
 	// Set up OS signal handling for graceful shutdown.
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Resolve Prometheus address.
+	// SIGHUP → config.reload audit event.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			uid := currentUID()
+			auditLog.RecordConfigReload(
+				cfgFile,
+				"SIGHUP",
+				[]string{},
+				0,
+				uid,
+			)
+			logger.Info("SIGHUP received; config reload not yet implemented — audited only")
+		}
+	}()
+
 	promAddr := cfg.Prometheus.Addr
 	if opts.prometheusAddr != "" {
 		promAddr = opts.prometheusAddr
@@ -101,12 +148,11 @@ func runStart(ctx context.Context, opts startOpts) error {
 	for _, l := range loaders {
 		closer, err := l.Load()
 		if err != nil {
-			logger.Warn("failed to load eBPF program, skipping",
-				"program", l.Name(),
-				"error", err,
-			)
+			auditLog.RecordBPFLoad(l.Name(), false, err)
+			logger.Warn("failed to load eBPF program, skipping", "program", l.Name(), "error", err)
 			continue
 		}
+		auditLog.RecordBPFLoad(l.Name(), true, nil)
 		closers = append(closers, func() { _ = closer.Close() })
 		loadedCount++
 		logger.Info("loaded eBPF program", "program", l.Name())
@@ -134,12 +180,12 @@ func runStart(ctx context.Context, opts startOpts) error {
 		metrics.CollectorErrorsTotal.WithLabelValues(l.Name()).Add(0)
 	}
 
-	// Phase 2: Start the metrics bridge — reads BPF events and feeds Prometheus.
+	//  Phase 2: Metrics bridge
 	bridge := metrics.NewBridge(logger)
 	bridge.Start(ctx, loaders)
 	defer bridge.Stop()
 
-	// Phase 2b: Start environment adapter for event enrichment.
+	//  Phase 2b: Environment adapter
 	env := adapter.DetectEnvironment()
 	adpt := adapter.NewAdapter(logger, env)
 	if err := adpt.Start(ctx); err != nil {
@@ -148,13 +194,17 @@ func runStart(ctx context.Context, opts startOpts) error {
 	defer adpt.Stop()
 	logger.Info("environment adapter started", "adapter", adpt.Name(), "env", env)
 
-	// Phase 3: Start HTTP server for health and metrics.
+	//  Phase 3: HTTP server
 	var httpServer *http.Server
 	if opts.prometheus {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", healthzHandler(loadedCount, len(loaders)))
 		mux.HandleFunc("/readyz", readyzHandler(loadedCount, len(loaders)))
-		mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+		mux.Handle("/metrics", auditedMetricsHandler(
+			promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}),
+			cfg.Prometheus.BearerToken,
+			auditLog,
+		))
 
 		httpServer = &http.Server{
 			Addr:              promAddr,
@@ -189,7 +239,7 @@ func runStart(ctx context.Context, opts startOpts) error {
 
 	logger.Info("shutting down kerno daemon")
 
-	// Phase 4: Graceful shutdown.
+	//  Phase 4: Graceful HTTP shutdown
 	if httpServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
@@ -200,6 +250,25 @@ func runStart(ctx context.Context, opts startOpts) error {
 
 	logger.Info("kerno daemon stopped")
 	return nil
+}
+
+// auditedMetricsHandler wraps the Prometheus handler with optional
+// bearer-token authentication. Token mismatches are recorded as
+// auth.failure audit events.
+func auditedMetricsHandler(next http.Handler, bearerToken string, auditLog *audit.Logger) http.Handler {
+	if bearerToken == "" {
+		return next
+	}
+	expected := "Bearer " + bearerToken
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expected {
+			remoteIP := audit.RedactRemoteAddr(r.RemoteAddr)
+			auditLog.RecordAuthFailure("/metrics", "token_mismatch", remoteIP)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // buildLoaders creates the set of BPF loaders based on config.
@@ -270,4 +339,13 @@ func readyzHandler(loaded, total int) http.HandlerFunc {
 			"uptime":          time.Since(startTime).Seconds(),
 		})
 	}
+}
+
+func currentUID() int {
+	u, err := user.Current()
+	if err != nil {
+		return 0
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	return uid
 }

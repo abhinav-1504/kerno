@@ -309,7 +309,7 @@ func TestLogger_RecordAICall(t *testing.T) {
 func TestLogger_RecordBPFLoad_Failure(t *testing.T) {
 	l, buf := captureLogger(t)
 
-	l.RecordBPFLoad("syscall_latency", false, errTest("permission denied"))
+	l.RecordBPFLoad("syscall_latency", false, testError("permission denied"))
 
 	var rec audit.Record
 	if err := json.NewDecoder(buf).Decode(&rec); err != nil {
@@ -665,6 +665,6 @@ func TestCycleLinkage_EndToEnd(t *testing.T) {
 
 // helpers
 
-type errTest string
+type testError string
 
-func (e errTest) Error() string { return string(e) }
+func (e testError) Error() string { return string(e) }

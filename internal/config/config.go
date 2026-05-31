@@ -210,7 +210,7 @@ func Default() *Config {
 		Audit: AuditConfig{
 			FilePath:   "/var/log/kerno-audit.jsonl",
 			MaxSizeMB:  100,
-			MaxBackups: 5,
+			MaxBackups: 0,
 			Stderr:     true,
 		},
 	}

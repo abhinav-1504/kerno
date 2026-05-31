@@ -242,7 +242,7 @@ func (l *Logger) RecordAICall(
 func (l *Logger) RecordBPFLoad(program string, success bool, loadErr error) {
 	d := BPFLoadDetails{Program: program, Success: success}
 	if loadErr != nil {
-		d.Error = loadErr.Error()
+		d.Error, _ = Redact(loadErr.Error())
 	}
 	l.Record("bpf/loader", EventBPFLoad, d)
 }

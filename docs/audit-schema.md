@@ -280,7 +280,7 @@ File rotation is handled by [lumberjack](https://github.com/natefinch/lumberjack
 |---|---|---|
 | `audit.file_path` | `/var/log/kerno-audit.jsonl` | Absolute path. Empty string disables the file sink. |
 | `audit.max_size_mb` | `100` | Rotate when the file reaches this size in MB. |
-| `audit.max_backups` | `5` | Number of rotated files to keep. `0` = keep all. |
+| `audit.max_backups` | `0` | Number of rotated files to keep. `0` = unlimited (no auto-deletion). Set a non-zero value only if storage is constrained and your retention policy permits it. |
 | `audit.stderr` | `true` | Also emit records to stderr (journald-friendly). |
 
 Rotated files are named `kerno-audit-<timestamp>.jsonl.gz` by lumberjack. If you use an external log shipper (Fluentd, Vector, Promtail), point it at the directory and enable glob matching for `*.jsonl*`.

@@ -49,47 +49,47 @@ func TestConfigDiff(t *testing.T) {
 			expectApplied: []string{"prometheus.enabled"},
 		},
 
-		// Doctor thresholds (hot-reloadable)
+		// Doctor thresholds (restart required — daemon has no engine consumer)
 		{
 			name: "doctor.thresholds updated",
 			mutate: func(c *Config) {
 				c.Doctor.Thresholds.OOMMemoryPct = 99.0
 			},
-			expectApplied: []string{"doctor.thresholds"},
+			expectRestart: true,
 		},
 		{
 			name: "doctor.duration changes",
 			mutate: func(c *Config) {
 				c.Doctor.Duration = 5 * time.Minute
 			},
-			expectApplied: []string{"doctor.duration"},
+			expectRestart: true,
 		},
 
-		// AI config (hot-reloadable)
+		// AI config (restart required)
 		{
 			name: "ai config updated",
 			mutate: func(c *Config) {
 				c.AI.Enabled = !c.AI.Enabled
 			},
-			expectApplied: []string{"ai config"},
+			expectRestart: true,
 		},
 
-		//  Dashboard config (hot-reloadable)
+		// Dashboard config (restart required)
 		{
 			name: "dashboard config updated",
 			mutate: func(c *Config) {
 				c.Dashboard.Addr = ":3001"
 			},
-			expectApplied: []string{"dashboard config"},
+			expectRestart: true,
 		},
 
-		//  Kubernetes config (hot-reloadable)
+		// Kubernetes config (restart required)
 		{
 			name: "kubernetes config updated",
 			mutate: func(c *Config) {
 				c.Kubernetes.Enabled = !c.Kubernetes.Enabled
 			},
-			expectApplied: []string{"kubernetes config"},
+			expectRestart: true,
 		},
 
 		//  Collector toggles (RESTART REQUIRED)

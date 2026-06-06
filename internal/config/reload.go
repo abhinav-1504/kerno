@@ -124,19 +124,19 @@ func diff(old, next *Config) ReloadResult {
 		r.Applied = append(r.Applied, fmt.Sprintf("prometheus.enabled: %v -> %v", old.Prometheus.Enabled, next.Prometheus.Enabled))
 	}
 	if !reflect.DeepEqual(old.Doctor.Thresholds, next.Doctor.Thresholds) {
-		r.Applied = append(r.Applied, "doctor.thresholds updated")
+		r.RestartRequired = append(r.RestartRequired, "doctor.thresholds updated (restart required)")
 	}
 	if old.Doctor.Duration != next.Doctor.Duration {
-		r.Applied = append(r.Applied, fmt.Sprintf("doctor.duration: %s -> %s", old.Doctor.Duration, next.Doctor.Duration))
+		r.RestartRequired = append(r.RestartRequired, fmt.Sprintf("doctor.duration: %s -> %s (restart required)", old.Doctor.Duration, next.Doctor.Duration))
 	}
 	if !reflect.DeepEqual(old.AI, next.AI) {
-		r.Applied = append(r.Applied, "ai config updated")
+		r.RestartRequired = append(r.RestartRequired, "ai config updated (restart required)")
 	}
 	if !reflect.DeepEqual(old.Dashboard, next.Dashboard) {
-		r.Applied = append(r.Applied, "dashboard config updated")
+		r.RestartRequired = append(r.RestartRequired, "dashboard config updated (restart required)")
 	}
 	if !reflect.DeepEqual(old.Kubernetes, next.Kubernetes) {
-		r.Applied = append(r.Applied, "kubernetes config updated")
+		r.RestartRequired = append(r.RestartRequired, "kubernetes config updated (restart required)")
 	}
 
 	// Requires restart because BPF programs are already loaded.

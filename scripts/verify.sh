@@ -14,8 +14,7 @@
 #   7. doctor pipeline      (graceful degradation, JSON valid, exit codes)
 #   8. chaos pipeline       (every scenario runs cleanly + cleans up)
 #   9. induce-detect pairs  (every chaos scenario triggers its paired rule)
-#  10. daemon mode          (start, /metrics, /healthz, /readyz, clean stop,
-#                            SIGHUP hot-reload)
+#  10. daemon mode          (start, /metrics, /healthz, /readyz, clean stop)
 #  11. manifests            (helm lint, k8s yaml syntax)
 #
 # Each phase prints PASS/FAIL with a one-line reason. Final summary
@@ -34,6 +33,7 @@ KERNO=bin/kerno
 BPF_VERIFY=bin/bpf-verify
 
 # ─── State ────────────────────────────────────────────────────────────────
+# Each phase appends PASS or FAIL <name> <reason> to RESULTS.
 RESULTS=()
 SKIPPED=()
 
@@ -74,10 +74,9 @@ phase_build() {
     echo "==> 2. build pipeline"
     local n=$1
 
-    # make generate runs bpf2go and post-processes build tags so that the
-    # generated *_bpfel.go files require the 'ebpf' tag and do not conflict
-    # with gen_stub.go. Using 'go generate ./internal/bpf/...' directly skips
-    # that post-processing and breaks the build-tag invariant.
+    # `make generate` runs bpf2go AND post-processes the build tags so
+    # generated files are gated behind `ebpf`. Using `go generate` directly
+    # would skip the post-processing and conflict with the stubs.
     if make generate >/tmp/verify-generate.log 2>&1; then
         local count
         count=$(ls internal/bpf/*_bpfel.go 2>/dev/null | wc -l)
@@ -91,12 +90,12 @@ phase_build() {
         return 1
     fi
 
-    # make build-ebpf compiles with the 'ebpf' tag so real BPF programs are
-    # linked in. 'make build' produces the stub binary and cannot load BPF.
+    # `make build-ebpf` selects the generated bindings (ebpf tag) so the
+    # binary can actually load BPF programs in the doctor/daemon phases.
     if make build-ebpf >/tmp/verify-build.log 2>&1; then
         phase_pass "$n" "make build-ebpf succeeded → $($KERNO version | head -1)"
     else
-        phase_fail "$n" "make build-ebpf failed"
+        phase_fail "$n" "make build-ebpf failed (see /tmp/verify-build.log)"
     fi
 
     if go build -o "$BPF_VERIFY" ./cmd/bpf-verify >/dev/null 2>&1; then
@@ -122,6 +121,8 @@ phase_quality() {
         phase_fail "$n" "go vet: $(wc -l < /tmp/verify-vet.log) issues"
     fi
 
+    # One unified test run covering: pass/fail, race detector, coverage.
+    # Replaces the previous three separate `go test` invocations.
     if go test -race -cover ./... -count=1 -timeout 180s >/tmp/verify-test.log 2>&1; then
         local pkgs
         pkgs=$(grep -c "^ok " /tmp/verify-test.log)
@@ -140,6 +141,8 @@ phase_quality() {
         phase_skip "$n" "golangci-lint not installed"
     fi
 
+    # Per-package coverage floors are checked against the same test
+    # output from above — no re-run.
     declare -A FLOORS=(
         ["aggregator"]=80
         ["ai"]=70
@@ -202,6 +205,7 @@ phase_smoke() {
         fi
     done
 
+    # chaos --list must show all scenarios.
     local scenarios
     scenarios=$("$KERNO" chaos --list | tail -n +2 | awk '{print $1}' | sort | xargs)
     if [[ "$scenarios" == "cascade cpu disk-sat fd-leak memory tcp-churn tcp-loss" ]]; then
@@ -215,6 +219,7 @@ phase_doctor() {
     echo "==> 7. doctor pipeline"
     local n=$1
 
+    # Without sudo: should degrade gracefully and emit a healthy report.
     if "$KERNO" doctor --duration 1s --output json >/tmp/verify-doctor-clean.json 2>/dev/null; then
         if jq -e '.findings[0].rule == "healthy_system"' /tmp/verify-doctor-clean.json >/dev/null; then
             phase_pass "$n" "graceful degradation without sudo → healthy_system finding"
@@ -225,24 +230,28 @@ phase_doctor() {
         phase_fail "$n" "doctor --output json failed without sudo"
     fi
 
+    # JSON must be parseable and have expected schema.
     if jq -e '.summary.critical, .summary.warning, .summary.info' /tmp/verify-doctor-clean.json >/dev/null; then
         phase_pass "$n" "JSON has summary.{critical, warning, info}"
     else
         phase_fail "$n" "JSON summary fields missing"
     fi
 
+    # Pretty render must not crash.
     if "$KERNO" doctor --duration 1s 2>/dev/null | grep -q "KERNO DOCTOR"; then
         phase_pass "$n" "pretty renderer produces banner"
     else
         phase_fail "$n" "pretty renderer broken"
     fi
 
+    # --exit-code should return 0 on healthy.
     if "$KERNO" doctor --duration 1s --exit-code >/dev/null 2>&1; then
         phase_pass "$n" "--exit-code returns 0 on healthy"
     else
         phase_fail "$n" "--exit-code returned non-zero on healthy run"
     fi
 
+    # explain without API key should fail with a clear message.
     local explain_out
     explain_out=$("$KERNO" explain "OOM killer invoked" 2>&1 || true)
     if echo "$explain_out" | grep -q "AI is not configured"; then
@@ -265,6 +274,7 @@ phase_chaos() {
         fi
     done
 
+    # Cascade is longer; just verify it exits.
     if "$KERNO" chaos --induce cascade --duration 3s --intensity low --yes \
             >/tmp/verify-chaos-cascade.log 2>&1; then
         phase_pass "$n" "cascade scenario completes cleanly"
@@ -272,6 +282,7 @@ phase_chaos() {
         phase_fail "$n" "cascade scenario errored"
     fi
 
+    # Verify temp files are cleaned up after every run.
     if ! ls /tmp/kerno-chaos-* 2>/dev/null >/dev/null; then
         phase_pass "$n" "temp files cleaned up after every run"
     else
@@ -283,23 +294,32 @@ phase_induce_detect() {
     echo "==> 9. induce → detect pairings"
     local n=$1
 
+    # Format: "scenario:rule" or "scenario:rule:ENV=val" when the doctor
+    # invocation needs an extra environment variable (e.g. cgroup-memory
+    # writes to /tmp and requires KERNO_CGROUP_ROOT to be pointed there).
     local pairings=(
         "disk-sat:disk_io_bottleneck"
         "fd-leak:fd_leak"
         "cpu:scheduler_contention"
         "tcp-churn:scheduler_contention"
+        "cgroup-memory:memory_limit_pressure:KERNO_CGROUP_ROOT=/tmp/kerno-chaos-cgroup"
     )
 
     for p in "${pairings[@]}"; do
-        local scenario="${p%%:*}"
-        local expected="${p##*:}"
+        local scenario expected doctor_env
+        scenario="${p%%:*}"
+        rest="${p#*:}"
+        expected="${rest%%:*}"
+        doctor_env="${rest#*:}"
+        # doctor_env equals expected when there is no third field.
+        [[ "$doctor_env" == "$expected" ]] && doctor_env=""
 
         "$KERNO" chaos --induce "$scenario" --duration 12s --intensity high --yes \
             >/tmp/verify-chaos-"$scenario"-id.log 2>&1 &
         local cpid=$!
         sleep 1
 
-        sudo "$KERNO" --config scripts/verify-config.yaml \
+        env $doctor_env sudo -E "$KERNO" --config scripts/verify-config.yaml \
             doctor --duration 10s --output json \
             >/tmp/verify-doctor-"$scenario".json 2>/tmp/verify-doctor-"$scenario".log
 
@@ -318,12 +338,11 @@ phase_induce_detect() {
     done
 }
 
-# Daemon phase (includes SIGHUP hot-reload test).
-
 phase_daemon() {
     echo "==> 10. daemon mode"
     local n=$1
 
+    # Pick a free local port.
     local port=19099
     sudo "$KERNO" start --prometheus-addr ":$port" >/tmp/verify-daemon.log 2>&1 &
     local dpid=$!
@@ -353,7 +372,9 @@ phase_daemon() {
         phase_fail "$n" "/readyz did not return 200"
     fi
 
-    # /metrics emits prom format.
+    # /metrics emits prom format. Capture full body so we can show it
+    # on failure and check for both HELP lines and the self-monitoring
+    # metric in the same fetch.
     curl -sf "localhost:$port/metrics" >/tmp/verify-metrics.txt 2>/dev/null || true
     if grep -q "^# HELP" /tmp/verify-metrics.txt; then
         phase_pass "$n" "/metrics returns valid Prometheus exposition ($(wc -l </tmp/verify-metrics.txt) lines)"
@@ -364,10 +385,15 @@ phase_daemon() {
     if grep -q "^kerno_collector_events_total" /tmp/verify-metrics.txt; then
         phase_pass "$n" "/metrics includes kerno_collector_events_total"
     elif grep -q "^kerno_bpf_programs_loaded" /tmp/verify-metrics.txt; then
+        # Metric is registered but no events have flowed yet — acceptable
+        # state right after daemon startup. The pre-init in start.go
+        # should populate the counter at zero, but if even that didn't
+        # happen we surface what's actually there.
         phase_fail "$n" "/metrics missing kerno_collector_events_total — has $(grep -c '^kerno_' /tmp/verify-metrics.txt) other kerno_ metrics"
     else
         phase_fail "$n" "/metrics has no kerno_ metrics at all"
     fi
+
 
     # SIGHUP hot-reload test:
     # 1. Write a new config with a different log_level and tighter thresholds.
@@ -375,17 +401,15 @@ phase_daemon() {
     # 3. Wait briefly for the reload to settle.
     # 4. Check the daemon log for the reload success message.
     # 5. Verify the daemon is still alive (no crash).
-
     echo "     [SIGHUP hot-reload]"
-
     cat >/tmp/verify-sighup-config.yaml <<'YAML'
 log_level: debug
 log_format: json
 doctor:
   duration: 30s
   thresholds:
-    syscall_p99_warning_ns: 50000000   # 50ms  (was 100ms)
-    syscall_p99_critical_ns: 250000000 # 250ms (was 500ms)
+    syscall_p99_warning_ns: 50000000
+    syscall_p99_critical_ns: 250000000
     tcp_retransmit_pct: 1.0
     oom_memory_pct: 90.0
     disk_p99_warning_ns: 50000000
@@ -399,51 +423,43 @@ prometheus:
 ai:
   enabled: false
 YAML
-
     cp /tmp/verify-sighup-config.yaml /tmp/verify-active-config.yaml
-
     sudo kill -HUP "$dpid" 2>/dev/null
-
     sleep 3
-
     if sudo kill -0 "$dpid" 2>/dev/null; then
         phase_pass "$n" "daemon still alive after SIGHUP (no crash)"
     else
         phase_fail "$n" "daemon crashed after SIGHUP"
         return 1
     fi
-
     if grep -q "config reloaded" /tmp/verify-daemon.log 2>/dev/null; then
         local applied
         applied=$(grep "config reloaded" /tmp/verify-daemon.log | tail -1)
-        phase_pass "$n" "SIGHUP: reload logged — $applied"
+        phase_pass "$n" "SIGHUP: reload logged"
     else
-        phase_fail "$n" "SIGHUP: 'config reloaded' not found in daemon log"
+        phase_fail "$n" "SIGHUP: config reloaded not found in daemon log"
     fi
-
     if grep -q "log level changed" /tmp/verify-daemon.log 2>/dev/null; then
         phase_pass "$n" "SIGHUP: log level hot-swap confirmed in daemon log"
     else
         phase_skip "$n" "SIGHUP: log level change line not found (may already be debug)"
     fi
-
     if curl -sf "localhost:$port/metrics" >/dev/null 2>/dev/null; then
         phase_pass "$n" "SIGHUP: /metrics still responsive after reload"
     else
         phase_fail "$n" "SIGHUP: /metrics not responding after reload"
     fi
-
     if grep -q "ExecReload=/bin/kill -HUP" deploy/systemd/kerno.service; then
-        phase_pass "$n" "kerno.service has ExecReload=/bin/kill -HUP \$MAINPID"
+        phase_pass "$n" "kerno.service has ExecReload line"
     else
         phase_fail "$n" "kerno.service missing ExecReload line"
     fi
 
     # Graceful shutdown.
-    sudo kill -INT "$dpid" 2>/dev/null || true
+    sudo kill -INT $dpid 2>/dev/null || true
     local stopped=0
     for i in 1 2 3 4 5; do
-        if ! sudo kill -0 "$dpid" 2>/dev/null; then
+        if ! sudo kill -0 $dpid 2>/dev/null; then
             stopped=1
             break
         fi
@@ -453,7 +469,7 @@ YAML
         phase_pass "$n" "daemon stopped cleanly within 5s of SIGINT"
     else
         phase_fail "$n" "daemon did not stop within 5s — sending SIGKILL"
-        sudo kill -KILL "$dpid" 2>/dev/null || true
+        sudo kill -KILL $dpid 2>/dev/null || true
     fi
 }
 
@@ -471,10 +487,11 @@ phase_manifests() {
         phase_skip "$n" "helm not installed"
     fi
 
+    # YAML syntax check on every k8s manifest
     local k8s_failed=0
     for f in deploy/k8s/*.yaml; do
         if python3 -c "import yaml,sys; yaml.safe_load_all(open('$f'))" 2>/dev/null; then
-            :
+            :  # OK
         else
             phase_fail "$n" "invalid YAML: $f"
             k8s_failed=$((k8s_failed+1))
@@ -484,6 +501,7 @@ phase_manifests() {
         phase_pass "$n" "$(ls deploy/k8s/*.yaml | wc -l) k8s manifests parse as YAML"
     fi
 
+    # systemd unit + chaos config
     for f in deploy/systemd/kerno.service deploy/systemd/kerno.yaml scripts/verify-config.yaml; do
         if [[ -f "$f" ]]; then
             phase_pass "$n" "$(basename "$f") present"
@@ -492,6 +510,7 @@ phase_manifests() {
         fi
     done
 
+    # goreleaser config
     if [[ -f .goreleaser.yml ]]; then
         if require_cmd goreleaser; then
             if goreleaser check >/dev/null 2>&1; then
@@ -505,6 +524,11 @@ phase_manifests() {
     fi
 }
 
+# ─── tc netem TCP retransmit detection ────────────────────────────────────
+#
+# Apply packet loss to loopback, run a TCP transfer, and verify
+# kerno doctor flags the resulting retransmit storm.
+
 phase_tc_netem() {
     echo "==> 12. tc netem → tcp_retransmit_storm"
     local n=$1
@@ -514,6 +538,7 @@ phase_tc_netem() {
         return 0
     fi
 
+    # Apply 30% packet loss to lo for the duration of the test.
     if ! sudo tc qdisc add dev lo root netem loss 30% 2>/tmp/verify-tc.log; then
         if grep -q "Exclusivity flag" /tmp/verify-tc.log; then
             sudo tc qdisc del dev lo root 2>/dev/null || true
@@ -528,6 +553,9 @@ phase_tc_netem() {
     fi
     trap 'sudo tc qdisc del dev lo root 2>/dev/null || true' RETURN
 
+    # tcp-loss pumps bulk data so packet loss → retransmits is unavoidable.
+    # tcp-churn (which only opens+closes) doesn't reliably retransmit on
+    # lo because SYN often makes it through on first try.
     "$KERNO" chaos --induce tcp-loss --duration 12s --intensity high --yes \
         >/tmp/verify-tcnetem-chaos.log 2>&1 &
     local cpid=$!
@@ -540,6 +568,7 @@ phase_tc_netem() {
     wait $cpid 2>/dev/null || true
     sudo tc qdisc del dev lo root 2>/dev/null || true
 
+    # Either tcp_retransmit_storm or tcp_rtt_degradation should fire.
     if jq -e '.findings[] | select(.rule == "tcp_retransmit_storm" or .rule == "tcp_rtt_degradation")' \
             /tmp/verify-tcnetem-doctor.json >/dev/null 2>&1; then
         local rule
@@ -547,6 +576,7 @@ phase_tc_netem() {
             /tmp/verify-tcnetem-doctor.json | head -1)
         phase_pass "$n" "tc netem 30% loss → $rule fired"
     else
+        # Diagnostic: dump the observed TCP signals so we can tune the rule.
         local rate retx total
         rate=$(jq -r '.signals.tcp.retransmitRate // "(no data)"' /tmp/verify-tcnetem-doctor.json 2>/dev/null)
         retx=$(jq -r '.signals.tcp.totalRetransmits // 0' /tmp/verify-tcnetem-doctor.json 2>/dev/null)
@@ -554,6 +584,8 @@ phase_tc_netem() {
         phase_fail "$n" "no TCP rule fired (retransmitRate=$rate, retx=$retx, conns=$total)"
     fi
 }
+
+# ─── stress-ng integration ────────────────────────────────────────────────
 
 phase_stress_ng() {
     echo "==> 13. stress-ng integration"
@@ -564,6 +596,7 @@ phase_stress_ng() {
         return 0
     fi
 
+    # CPU contention via stress-ng.
     stress-ng --cpu "$(($(nproc) * 4))" --timeout 12s \
         >/tmp/verify-stress-cpu.log 2>&1 &
     local spid=$!
@@ -580,6 +613,7 @@ phase_stress_ng() {
         phase_fail "$n" "stress-ng --cpu did not trip a CPU rule"
     fi
 
+    # Disk fsync contention via stress-ng.
     stress-ng --hdd 8 --hdd-bytes 16M --timeout 12s \
         >/tmp/verify-stress-hdd.log 2>&1 &
     spid=$!
@@ -597,6 +631,15 @@ phase_stress_ng() {
     fi
 }
 
+# ─── OOM pressure detection ───────────────────────────────────────────────
+#
+# We DON'T allocate enough memory to actually trigger OOM (would kill
+# the test runner). Instead we run kerno doctor with a config that
+# treats current-usage as critical (oom_memory_pct: 0.0), so any non-zero
+# memory use reports as OOM-imminent. That proves the rule code path
+# fires correctly. Real OOM detection on a memory-limited VM is the
+# integration variant and is left to the v0.1 Ubuntu test box.
+
 phase_oom_pressure() {
     echo "==> 14. OOM imminent rule path"
     local n=$1
@@ -607,7 +650,7 @@ log_format: text
 doctor:
   duration: 5s
   thresholds:
-    oom_memory_pct: 0.0
+    oom_memory_pct: 0.0   # treat any memory usage as triggering
 prometheus:
   enabled: false
 ai:
@@ -618,6 +661,10 @@ YAML
         doctor --duration 5s --output json \
         >/tmp/verify-oom-doctor.json 2>/tmp/verify-oom-doctor.log
 
+    # Note: kerno doesn't yet have a procfs memory poller, so the
+    # signals.memory snapshot is nil unless cgroup PSI / meminfo polling
+    # is implemented (Phase 10.4). Until then, the rule cannot fire
+    # without that collector. Mark as SKIP so the gate is honest.
     if jq -e '.signals.memory != null' /tmp/verify-oom-doctor.json >/dev/null 2>&1; then
         if jq -e '.findings[] | select(.rule == "oom_imminent")' \
                 /tmp/verify-oom-doctor.json >/dev/null 2>&1; then
@@ -630,11 +677,20 @@ YAML
     fi
 }
 
+# ─── Phase registry ───────────────────────────────────────────────────────
+
 phase_live() {
     echo "==> 15. live commands (trace / watch / audit)"
     local n=$1
 
+    # Each command needs eBPF (sudo) — except audit, which uses inotify.
+    # Run for 2s so we catch crashes / regressions without hammering the
+    # box. Output goes to /dev/null; we check only the exit code.
+
     for sub in syscall disk sched; do
+        # Only `trace syscall` has --top (top-N aggregation mode); the
+        # others are pure stream tracers, so we just bound their wall
+        # clock with --duration.
         local extra=""
         if [[ "$sub" == "syscall" ]]; then
             extra="--top 5"
@@ -667,6 +723,7 @@ phase_live() {
         fi
     done
 
+    # audit files works without root for /tmp.
     if "$KERNO" audit files --watch /tmp --duration 2s \
             >/tmp/verify-audit.log 2>&1; then
         phase_pass "$n" "audit files --watch /tmp ran cleanly"
@@ -674,8 +731,6 @@ phase_live() {
         phase_fail "$n" "audit files exited non-zero (see /tmp/verify-audit.log)"
     fi
 }
-
-# ─── Phase registry ───────────────────────────────────────────────────────
 
 declare -A PHASES=(
     [deps]=phase_deps
@@ -740,7 +795,7 @@ for r in "${RESULTS[@]}"; do
     esac
 done
 
-echo "==================================================================="
+echo "═══════════════════════════════════════════════════════════════════"
 echo "Verification Summary"
 echo "  Phases run:    ${#SELECTED[@]}"
 echo "  Checks passed: $PASS"

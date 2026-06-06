@@ -93,8 +93,11 @@ type startOpts struct {
 // reloadableSubsystems groups every live subsystem that the SIGHUP handler
 // may update. loadedCount and totalLoaders are written once at construction
 // and never mutated, so no mutex is needed.
+//
+// httpServer must not be copied after first use; always access via pointer
+// to this struct so atomic.Pointer's noCopy invariant is respected.
 type reloadableSubsystems struct {
-	httpServer   **http.Server // pointer-to-pointer so rebind can swap the server
+	httpServer   atomic.Pointer[http.Server]
 	opts         startOpts
 	loadedCount  int
 	totalLoaders int
@@ -185,13 +188,15 @@ func runStart(ctx context.Context, opts startOpts) error {
 	logger.Info("environment adapter started", "adapter", adpt.Name(), "env", env)
 
 	// Phase 3: HTTP server (health + metrics).
-	httpServer := startHTTPServer(logger, opts, promAddr, loadedCount, totalLoaders)
-
+	// reloadableSubs is heap-allocated via & so atomic.Pointer fields are
+	// never copied; all access goes through the pointer.
 	reloadableSubs := &reloadableSubsystems{
-		httpServer:   &httpServer,
 		opts:         opts,
 		loadedCount:  loadedCount,
 		totalLoaders: totalLoaders,
+	}
+	if srv := startHTTPServer(logger, opts, promAddr, loadedCount, totalLoaders); srv != nil {
+		reloadableSubs.httpServer.Store(srv)
 	}
 
 	// SIGHUP goroutine: runs for the lifetime of the daemon.
@@ -226,10 +231,10 @@ func runStart(ctx context.Context, opts startOpts) error {
 	logger.Info("shutting down kerno daemon")
 
 	// Phase 4: graceful HTTP shutdown.
-	if httpServer != nil {
+	if srv := reloadableSubs.httpServer.Load(); srv != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
-		if err := httpServer.Shutdown(stopCtx); err != nil {
+		if err := srv.Shutdown(stopCtx); err != nil {
 			logger.Warn("HTTP server shutdown error", "error", err)
 		}
 	}
@@ -278,7 +283,7 @@ func handleSIGHUP(subs *reloadableSubsystems) {
 	if oldAddr != newAddr || oldCfg.Prometheus.Enabled != newCfg.Prometheus.Enabled {
 		logger.Info("prometheus config changed, rebinding",
 			"old", oldAddr, "new", newAddr)
-		rebindPrometheus(logger, subs.httpServer, newAddr,
+		rebindPrometheus(logger, &subs.httpServer, newAddr,
 			subs.loadedCount, subs.totalLoaders,
 			newCfg.Prometheus.Enabled,
 		)
@@ -326,14 +331,19 @@ func startHTTPServer(
 // rebindPrometheus gracefully shuts down the current HTTP server and starts
 // a new one on newAddr. Called when prometheus.addr or prometheus.enabled
 // changes on SIGHUP.
+//
+// If the new server fails to bind (e.g. the old listener was not released in
+// time after a Shutdown timeout), the failure is logged and srvPtr is set to
+// nil so callers know no metrics server is running. A dead *http.Server is
+// never stored.
 func rebindPrometheus(
 	logger *slog.Logger,
-	srvPtr **http.Server,
+	srvPtr *atomic.Pointer[http.Server],
 	newAddr string,
 	loadedCount, total int,
 	enabled bool,
 ) {
-	old := *srvPtr
+	old := srvPtr.Load()
 
 	if old != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -344,20 +354,41 @@ func rebindPrometheus(
 	}
 
 	if !enabled {
-		*srvPtr = nil
+		srvPtr.Store(nil)
 		logger.Info("prometheus disabled, HTTP server stopped")
 		return
 	}
 
 	srv := buildHTTPServer(newAddr, loadedCount, total)
+
+	// bindErr receives the result of ListenAndServe. A non-nil error that
+	// arrives within the probe window means the port is still held (the old
+	// Shutdown timed out) or the address is otherwise unavailable. In that
+	// case we must not store a dead *http.Server in srvPtr.
+	bindErr := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server restarted", "addr", newAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := srv.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP server error after rebind", "error", err)
+			bindErr <- err
+			return
 		}
+		bindErr <- nil
 	}()
 
-	*srvPtr = srv
+	// Give ListenAndServe 200 ms to fail fast (address already in use).
+	// If it is still running after that window the bind succeeded and we
+	// store the server. If it returned an error we surface it and store nil
+	// so the next reload or shutdown does not operate on a dead pointer.
+	select {
+	case err := <-bindErr:
+		logger.Error("prometheus rebind failed, no metrics server running",
+			"addr", newAddr, "error", err)
+		srvPtr.Store(nil)
+	case <-time.After(200 * time.Millisecond):
+		srvPtr.Store(srv)
+	}
 }
 
 // buildHTTPServer assembles the mux and http.Server without starting it.

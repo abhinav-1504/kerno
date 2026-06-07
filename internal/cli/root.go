@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -83,6 +82,7 @@ and copy-paste fix steps.`,
 	auditCmd := newAuditCmd()
 	chaosCmd := newChaosCmd()
 	versionCmd := newVersionCmd()
+	completionCmd := newCompletionCmd()
 
 	root.AddGroup(
 		&cobra.Group{ID: "diagnose", Title: "Incident diagnosis:"},
@@ -98,15 +98,17 @@ and copy-paste fix steps.`,
 	startCmd.GroupID = "ops"
 	chaosCmd.GroupID = "ops"
 	versionCmd.GroupID = "ops"
+	completionCmd.GroupID = "ops"
 
-	root.AddCommand(doctorCmd, explainCmd, predictCmd, traceCmd, watchCmd, auditCmd, startCmd, chaosCmd, versionCmd)
+	root.AddCommand(doctorCmd, explainCmd, predictCmd, traceCmd, watchCmd, auditCmd, startCmd, chaosCmd, versionCmd, completionCmd)
 
 	return root
 }
 
 // initConfig reads the config file and environment variables.
 func initConfig(cmd *cobra.Command) error {
-	v := viper.New()
+	// config.NewViper wires up KERNO_* env var resolution for every key.
+	v := config.NewViper()
 
 	// Config file discovery.
 	// Precedence: --config flag > KERNO_CONFIG env > auto-discover.
@@ -124,17 +126,17 @@ func initConfig(cmd *cobra.Command) error {
 		v.AddConfigPath(".")
 	}
 
-	// Environment variables: KERNO_LOG_LEVEL, KERNO_PROMETHEUS_ADDR, etc.
-	v.SetEnvPrefix("KERNO")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
-	v.AutomaticEnv()
-
 	// Bind CLI flags to viper.
 	if err := v.BindPFlag("log_level", cmd.Root().PersistentFlags().Lookup("log-level")); err != nil {
 		return fmt.Errorf("binding log-level flag: %w", err)
 	}
+
 	if err := v.BindPFlag("log_format", cmd.Root().PersistentFlags().Lookup("log-format")); err != nil {
 		return fmt.Errorf("binding log-format flag: %w", err)
+	}
+
+	if err := v.BindPFlag("no_color", cmd.Root().PersistentFlags().Lookup("no-color")); err != nil {
+		return fmt.Errorf("binding no-color flag: %w", err)
 	}
 
 	// Read config file (not an error if it doesn't exist).

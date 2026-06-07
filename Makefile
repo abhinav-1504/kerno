@@ -43,10 +43,10 @@ UI_DIST_DIR      := internal/dashboard/dist/assets
 
 # ─── Phony Targets ───────────────────────────────────────────────────────────
 
-.PHONY: all build build-ebpf build-debug test test-cover test-race lint vet check \
+.PHONY: all build build-ebpf build-debug test test-integration test-cover test-race lint vet check \
 	fmt clean bpf generate docker help \
 	ui-fetch ui-dev install-tools setup precommit \
-	verify demo demo-cast bpf-verify
+	verify demo demo-cast bpf-verify manpage
 
 .DEFAULT_GOAL := help
 
@@ -109,6 +109,10 @@ generate:
 test:
 	$(GO) test ./... -count=1 -timeout 60s
 
+## test-integration: Run Docker-backed integration tests
+test-integration:
+	$(GO) test $(GOFLAGS) -tags integration ./... -count=1 -timeout 180s
+
 ## test-race: Run tests with race detector
 test-race:
 	$(GO) test ./... -count=1 -race -timeout 120s
@@ -166,6 +170,13 @@ docker:
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg DATE=$(DATE) \
 		.
+
+# ─── Man Pages ────────────────────────────────────────────────────────────────
+
+## manpage: Generate man pages for all CLI commands
+manpage:
+	@mkdir -p docs/man
+	go run ./cmd/kerno-mangen/
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
 

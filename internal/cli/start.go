@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -357,28 +358,22 @@ func rebindPrometheus(
 		return
 	}
 
-	srv := buildHTTPServer(newAddr, loadedCount, total)
-
-	bindErr := make(chan error, 1)
-	go func() {
-		logger.Info("HTTP server restarted", "addr", newAddr)
-		err := srv.ListenAndServe()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("HTTP server error after rebind", "error", err)
-			bindErr <- err
-			return
-		}
-		bindErr <- nil
-	}()
-
-	select {
-	case err := <-bindErr:
+	ln, err := net.Listen("tcp", newAddr)
+	if err != nil {
 		logger.Error("prometheus rebind failed, no metrics server running",
 			"addr", newAddr, "error", err)
 		srvPtr.Store(nil)
-	case <-time.After(200 * time.Millisecond):
-		srvPtr.Store(srv)
+		return
 	}
+
+	srv := buildHTTPServer(newAddr, loadedCount, total)
+	srvPtr.Store(srv)
+	go func() {
+		logger.Info("HTTP server restarted", "addr", newAddr)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("HTTP server error after rebind", "error", err)
+		}
+	}()
 }
 
 // buildHTTPServer assembles the mux and http.Server without starting it.

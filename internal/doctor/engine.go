@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/optiqor/kerno/internal/collector"
@@ -81,10 +80,8 @@ type Anomaly struct {
 //
 //	collect signals → evaluate rules → (optional AI enrichment) → render report
 type Engine struct {
-	// mu protects thresholds so UpdateThresholds (called from the SIGHUP
-	// goroutine) and Diagnose (called from the doctor command goroutine) never
-	// race. RWMutex is used because reads vastly outnumber writes.
-	mu         sync.RWMutex
+	// thresholds are set at construction time and are read-only after that.
+	// Changing thresholds requires a daemon restart (restart-required config class).
 	thresholds config.DoctorThresholds
 
 	analyzer   Analyzer
@@ -104,29 +101,12 @@ func NewEngine(thresholds config.DoctorThresholds, analyzer Analyzer, logger *sl
 	}
 }
 
-// UpdateThresholds hot-swaps the diagnostic thresholds without restarting the
-// engine. Safe to call from any goroutine (e.g. a SIGHUP handler). The next
-// call to Diagnose picks up the new values automatically.
-func (e *Engine) UpdateThresholds(t config.DoctorThresholds) {
-	e.mu.Lock()
-	e.thresholds = t
-	e.mu.Unlock()
-	e.logger.Info("doctor thresholds updated via hot-reload")
-}
-
 // Diagnose runs the full diagnostic pipeline against the supplied signals.
 func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Report, error) {
 	start := time.Now()
 
-	// Take a consistent snapshot of thresholds for this diagnostic run.
-	// Using RLock means concurrent Diagnose calls never block each other;
-	// only a concurrent UpdateThresholds call causes a brief wait.
-	e.mu.RLock()
-	thresholds := e.thresholds
-	e.mu.RUnlock()
-
 	// Phase 1: Evaluate deterministic rules.
-	findings := Evaluate(signals, thresholds)
+	findings := Evaluate(signals, e.thresholds)
 	e.logger.Debug("rules evaluated",
 		"findings", len(findings),
 		"duration_ms", time.Since(start).Milliseconds(),

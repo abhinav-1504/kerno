@@ -320,11 +320,16 @@ func startHTTPServer(
 		return nil
 	}
 
-	srv := buildHTTPServer(addr, loadedCount, total)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		logger.Error("failed to start HTTP server", "addr", addr, "error", err)
+		return nil
+	}
 
+	srv := buildHTTPServer(addr, loadedCount, total)
 	go func() {
 		logger.Info("starting HTTP server", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP server error", "error", err)
 		}
 	}()
@@ -358,7 +363,7 @@ func rebindPrometheus(
 		return
 	}
 
-	ln, err := net.Listen("tcp", newAddr)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", newAddr)
 	if err != nil {
 		logger.Error("prometheus rebind failed, no metrics server running",
 			"addr", newAddr, "error", err)

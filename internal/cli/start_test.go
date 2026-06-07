@@ -231,7 +231,7 @@ func TestRebindPrometheus_BindFail(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Hold a listener on the target address so the rebind bind fails fast.
-	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	blocker, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen blocker: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestRebindPrometheus_BindFail(t *testing.T) {
 // freeAddr picks a free TCP address on loopback and returns it as "host:port".
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("freeAddr: %v", err)
 	}
@@ -271,7 +271,7 @@ func waitReady(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		conn, err := (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext(context.Background(), "tcp", addr)
 		if err == nil {
 			conn.Close()
 			return

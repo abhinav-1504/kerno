@@ -39,6 +39,7 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
+          install-mode: source
           args: --timeout=5m
         env:
           GOTOOLCHAIN: go1.26.0

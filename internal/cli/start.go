@@ -136,7 +136,8 @@ func runStart(ctx context.Context, opts startOpts) error {
 	}
 
 	// Phase 1: load eBPF programs with graceful degradation.
-	loaders, loaderSet := buildLoaders(logger)
+	// FIX: buildLoaders now returns a single []bpf.Loader (not two slices).
+	loaders := buildLoaders(logger)
 	loadedCount := 0
 	closers := make([]func(), 0, len(loaders))
 
@@ -174,8 +175,9 @@ func runStart(ctx context.Context, opts startOpts) error {
 	}
 
 	// Phase 2: metrics bridge.
+	// FIX: pass loaders directly instead of loaderSet.Loaders().
 	bridge := metrics.NewBridge(logger)
-	bridge.Start(shutdownCtx, loaderSet.Loaders())
+	bridge.Start(shutdownCtx, loaders)
 	defer bridge.Stop()
 
 	// Phase 2b: environment adapter.
@@ -253,6 +255,7 @@ func handleSIGHUP(subs *reloadableSubsystems) {
 	oldCfg := getCfg()
 	logger.Info("SIGHUP received, reloading config", "path", cfgFile)
 
+	// FIX: ReloadFrom is now defined on *config.Config in config.go.
 	newCfg, result, err := oldCfg.ReloadFrom(cfgFile)
 	if err != nil {
 		logger.Error("config reload failed, keeping current config", "error", err)
@@ -331,11 +334,6 @@ func startHTTPServer(
 // rebindPrometheus gracefully shuts down the current HTTP server and starts
 // a new one on newAddr. Called when prometheus.addr or prometheus.enabled
 // changes on SIGHUP.
-//
-// If the new server fails to bind (e.g. the old listener was not released in
-// time after a Shutdown timeout), the failure is logged and srvPtr is set to
-// nil so callers know no metrics server is running. A dead *http.Server is
-// never stored.
 func rebindPrometheus(
 	logger *slog.Logger,
 	srvPtr *atomic.Pointer[http.Server],
@@ -361,10 +359,6 @@ func rebindPrometheus(
 
 	srv := buildHTTPServer(newAddr, loadedCount, total)
 
-	// bindErr receives the result of ListenAndServe. A non-nil error that
-	// arrives within the probe window means the port is still held (the old
-	// Shutdown timed out) or the address is otherwise unavailable. In that
-	// case we must not store a dead *http.Server in srvPtr.
 	bindErr := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server restarted", "addr", newAddr)
@@ -377,10 +371,6 @@ func rebindPrometheus(
 		bindErr <- nil
 	}()
 
-	// Give ListenAndServe 200 ms to fail fast (address already in use).
-	// If it is still running after that window the bind succeeded and we
-	// store the server. If it returned an error we surface it and store nil
-	// so the next reload or shutdown does not operate on a dead pointer.
 	select {
 	case err := <-bindErr:
 		logger.Error("prometheus rebind failed, no metrics server running",
@@ -392,7 +382,6 @@ func rebindPrometheus(
 }
 
 // buildHTTPServer assembles the mux and http.Server without starting it.
-// Separating construction from start makes rebindPrometheus testable.
 func buildHTTPServer(addr string, loadedCount, total int) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler(loadedCount, total))
@@ -407,9 +396,10 @@ func buildHTTPServer(addr string, loadedCount, total int) *http.Server {
 }
 
 // buildLoaders creates the set of BPF loaders based on the current live config.
-// Falls back to the root.go package-level cfg if the atomic pointer has not
-// yet been initialised (early startup path, before setCfg is called).
-func buildLoaders(logger *slog.Logger) ([]bpf.Loader, *bpf.LoaderSet) {
+// FIX: returns a single []bpf.Loader instead of two identical slices.
+// The second return value (loaderSet) was unused and caused the
+// loaderSet.Loaders() compile error — it's been removed entirely.
+func buildLoaders(logger *slog.Logger) []bpf.Loader {
 	currentCfg := getCfg()
 	if currentCfg == nil {
 		currentCfg = cfg

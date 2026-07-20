@@ -76,8 +76,8 @@ type TCPEvent struct {
 	PID         uint32
 	SAddr       uint32 // network byte order
 	DAddr       uint32 // network byte order
-	SPort       uint16
-	DPort       uint16
+	SPort       uint16 // host byte order
+	DPort       uint16 // host byte order (normalized in BPF from network order)
 	Family      uint16
 	EventType   TCPEventType
 	State       uint8

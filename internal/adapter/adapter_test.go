@@ -47,6 +47,31 @@ func TestParseCgroupPath(t *testing.T) {
 			"0::/\n",
 			"/",
 		},
+		{
+			"cgroup v1 memory not first",
+			"5:cpuset:/\n3:pids:/\n12:memory:/kubepods/burstable/pod123\n",
+			"/kubepods/burstable/pod123",
+		},
+		{
+			"cgroup v1 no memory controller",
+			"5:cpuset:/some/path\n3:pids:/some/path\n",
+			"/some/path",
+		},
+		{
+			"cgroup v1 multi-controller line",
+			"7:cpu,cpuacct:/kubepods/pod456\n11:memory:/kubepods/pod456\n",
+			"/kubepods/pod456",
+		},
+		{
+			"cgroup v1 memory with blkio first",
+			"8:blkio:/system.slice/docker-abc.scope\n12:memory:/system.slice/nginx.service\n",
+			"/system.slice/nginx.service",
+		},
+		{
+			"cgroup v1 combined memory controller line",
+			"5:cpu,memory:/kubepods/combined/pod789\n",
+			"/kubepods/combined/pod789",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

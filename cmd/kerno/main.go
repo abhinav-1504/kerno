@@ -21,6 +21,14 @@ import (
 
 func main() {
 	if err := cli.New().Execute(); err != nil {
+		type exitCoder interface {
+			ExitCode() int
+		}
+
+		if exitErr, ok := err.(exitCoder); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

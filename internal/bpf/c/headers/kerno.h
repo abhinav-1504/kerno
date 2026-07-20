@@ -14,6 +14,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -64,8 +65,8 @@ struct tcp_event {
     __u32 pid;
     __u32 saddr;    // IPv4 source address (network byte order)
     __u32 daddr;    // IPv4 destination address (network byte order)
-    __u16 sport;
-    __u16 dport;
+    __u16 sport;    // host byte order (as delivered by kernel tracepoints)
+    __u16 dport;    // host byte order (normalized from network order in BPF)
     __u16 family;   // AF_INET or AF_INET6
     __u8  event_type;  // TCP_EVENT_* subtype
     __u8  state;       // TCP state for state change events

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 )
 
 // EventMeta holds enrichment metadata that adapters attach to events.
@@ -139,7 +140,8 @@ func parseCgroupPath(content string) string {
 		}
 	}
 
-	// Fallback: return first non-empty path from any controller.
+	// Fallback: cgroup v1 — prefer the memory controller line.
+	var firstPath string
 	for i := 0; i < len(content); {
 		end := i
 		for end < len(content) && content[end] != '\n' {
@@ -152,17 +154,18 @@ func parseCgroupPath(content string) string {
 			i = end
 		}
 
-		// Find the last ':' — path is after it.
-		lastColon := -1
-		for j := len(line) - 1; j >= 0; j-- {
-			if line[j] == ':' {
-				lastColon = j
-				break
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) < 3 || fields[2] == "" {
+			continue
+		}
+		if firstPath == "" {
+			firstPath = fields[2]
+		}
+		for _, ctrl := range strings.Split(fields[1], ",") {
+			if ctrl == "memory" {
+				return fields[2]
 			}
 		}
-		if lastColon >= 0 && lastColon < len(line)-1 {
-			return line[lastColon+1:]
-		}
 	}
-	return ""
+	return firstPath
 }

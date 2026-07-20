@@ -47,8 +47,10 @@ int tracepoint_tcp_retransmit(struct trace_event_raw_tcp_retransmit_skb *ctx)
     // from ctx is rejected by the verifier on stricter kernels.
     bpf_probe_read_kernel(&e->saddr, 4, ctx->saddr);
     bpf_probe_read_kernel(&e->daddr, 4, ctx->daddr);
+    // sport is host byte order; dport is network byte order per
+    // tracepoint/tcp/tcp_retransmit_skb ABI — normalize both to host order.
     e->sport        = ctx->sport;
-    e->dport        = ctx->dport;
+    e->dport        = bpf_ntohs(ctx->dport);
     e->family       = ctx->family;
     e->event_type   = TCP_EVENT_RETRANSMIT;
     e->state        = (__u8)ctx->state;
@@ -92,8 +94,10 @@ int tracepoint_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *c
     // from ctx is rejected by the verifier on stricter kernels.
     bpf_probe_read_kernel(&e->saddr, 4, ctx->saddr);
     bpf_probe_read_kernel(&e->daddr, 4, ctx->daddr);
+    // sport is host byte order; dport is network byte order per
+    // tracepoint/sock/inet_sock_set_state ABI — normalize both to host order.
     e->sport        = ctx->sport;
-    e->dport        = ctx->dport;
+    e->dport        = bpf_ntohs(ctx->dport);
     e->family       = ctx->family;
     e->event_type   = event_type;
     e->state        = (__u8)ctx->newstate;

@@ -63,9 +63,14 @@ type Anomaly struct {
 	Description string `json:"description"`
 }
 
-// Engine orchestrates the full doctor diagnostic pipeline.
+// Engine orchestrates the full doctor diagnostic pipeline:
+//
+//	collect signals → evaluate rules → (optional AI enrichment) → render report
 type Engine struct {
+	// thresholds are set at construction time and are read-only after that.
+	// Changing thresholds requires a daemon restart (restart-required config class).
 	thresholds config.DoctorThresholds
+
 	analyzer   Analyzer
 	logger     *slog.Logger
 	auditLog   *audit.Logger
@@ -89,7 +94,7 @@ func NewEngine(thresholds config.DoctorThresholds, analyzer Analyzer, auditLog *
 	}
 }
 
-// Diagnose runs the full diagnostic pipeline against collected signals.
+// Diagnose runs the full diagnostic pipeline against the supplied signals.
 func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Report, error) {
 	start := time.Now()
 
@@ -100,7 +105,7 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 
-	// Phase 2: Optional AI enrichment.
+	// Phase 2: Optional AI enrichment (non-fatal on failure).
 	var analysis *AnalysisResponse
 	if e.analyzer != nil && hasActionableFindings(findings) {
 		e.logger.Info("running AI analysis")
@@ -111,12 +116,11 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 			History:  e.history,
 		})
 		if err != nil {
-			// AI failure is non-fatal — log and continue with deterministic results.
 			e.logger.Warn("AI analysis failed, continuing with rule-based results", "error", err)
 		}
 	}
 
-	// Phase 3: Build report.
+	// Phase 3: Build the report.
 	hostname, _ := os.Hostname()
 
 	// cycleID links this Diagnose run to all its audit records.
@@ -131,10 +135,12 @@ func (e *Engine) Diagnose(ctx context.Context, signals *collector.Signals) (*Rep
 		Duration:  signals.Duration,
 		Findings:  findings,
 		Analysis:  analysis,
-		Signals:   signals,
+		// Raw signals are carried through for the JSON renderer; the
+		// pretty renderer ignores this field.
+		Signals: signals,
 	}
 
-	// Track events collected.
+	// Track event counts for the report summary.
 	if signals.Syscall != nil {
 		report.EventsCollected += signals.Syscall.TotalCount
 	}
@@ -202,6 +208,8 @@ func hashFinding(f *Finding) string {
 	return audit.HashPayload(string(payload))
 }
 
+// hasActionableFindings returns true if there is at least one WARNING or
+// CRITICAL finding — the threshold below which AI enrichment is not worthwhile.
 func hasActionableFindings(findings []Finding) bool {
 	for i := range findings {
 		if findings[i].Severity >= SeverityWarning {

@@ -13,9 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"os/user"
 	"runtime/debug"
-	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -501,13 +499,4 @@ func readyzHandler(loaded, total int) http.HandlerFunc {
 			"uptime":          time.Since(startTime).Seconds(),
 		})
 	}
-}
-
-func currentUID() int {
-	u, err := user.Current()
-	if err != nil {
-		return 0
-	}
-	uid, _ := strconv.Atoi(u.Uid)
-	return uid
 }
